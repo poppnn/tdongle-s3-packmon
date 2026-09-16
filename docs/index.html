@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>poppn packmon — T-Dongle S3 WiFi Packet Monitor</title>
+<meta name="description" content="Browser-based flasher for poppn packmon, a WiFi packet monitor and deauth detector for the LilyGO T-Dongle S3.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
+<style>
+  :root {
+    --bg:       #080808;
+    --panel:    #121212;
+    --panel-2:  #191c1a;
+    --sep:      #262626;
+    --text:     #dedede;
+    --label:    #6b6d6b;
+    --accent:   #00ffbd;
+    --blue:     #4a8eff;
+    --warn:     #ffa100;
+    --danger:   #ff2020;
+    --ok:       #21ce21;
+    --mono:     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    background-image:
+      radial-gradient(900px 500px at 50% -10%, rgba(0,255,189,.09), transparent 70%),
+      radial-gradient(700px 400px at 90% 110%, rgba(74,142,255,.07), transparent 70%);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 48px 16px 80px; }
+
+  header { text-align: center; margin-bottom: 40px; }
+  .logo {
+    font-size: clamp(38px, 11vw, 60px);
+    font-weight: 700;
+    letter-spacing: .04em;
+    color: var(--accent);
+    text-shadow: 0 0 28px rgba(0,255,189,.35);
+    margin: 0;
+  }
+  .rule {
+    width: 180px; height: 2px; margin: 10px auto 14px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  }
+  .tag { color: var(--text); font-size: 15px; margin: 0; }
+  .sub { color: var(--label); font-size: 13px; margin: 4px 0 0; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--sep);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+  .panel h2 {
+    font-size: 12px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--label);
+    margin: 0 0 16px;
+    font-weight: 600;
+  }
+
+  .flash { text-align: center; }
+  .flash p.hint { color: var(--label); font-size: 13px; margin: 14px 0 0; }
+  esp-web-install-button { --esp-tools-button-color: #080808; }
+  esp-web-install-button[install-unsupported] { display: block; }
+  .btn {
+    display: inline-block;
+    background: var(--accent);
+    color: #041410;
+    border: 0;
+    border-radius: 8px;
+    padding: 13px 28px;
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: .02em;
+    cursor: pointer;
+    transition: transform .12s ease, box-shadow .12s ease;
+    box-shadow: 0 0 0 rgba(0,255,189,0);
+  }
+  .btn:hover { transform: translateY(-1px); box-shadow: 0 6px 22px rgba(0,255,189,.25); }
+  .unsupported {
+    color: var(--warn);
+    border: 1px solid rgba(255,161,0,.35);
+    background: rgba(255,161,0,.07);
+    border-radius: 8px;
+    padding: 14px 16px;
+    font-size: 13.5px;
+    text-align: left;
+  }
+
+  ol.steps { margin: 0; padding-left: 20px; }
+  ol.steps li { margin-bottom: 8px; }
+  ol.steps li::marker { color: var(--accent); }
+
+  ul.feat { list-style: none; margin: 0; padding: 0; }
+  ul.feat li { padding-left: 22px; position: relative; margin-bottom: 9px; }
+  ul.feat li::before {
+    content: "▸"; position: absolute; left: 0; color: var(--accent);
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  td { padding: 7px 0; border-bottom: 1px solid var(--sep); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  td.k { color: var(--label); width: 42%; }
+  td.v { color: var(--text); }
+
+  .note {
+    border-left: 2px solid var(--warn);
+    background: rgba(255,161,0,.06);
+    padding: 12px 16px;
+    font-size: 13.5px;
+    color: #c9c2b4;
+    border-radius: 0 8px 8px 0;
+  }
+  .note b { color: var(--warn); }
+
+  code {
+    background: var(--panel-2);
+    border: 1px solid var(--sep);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 13px;
+    color: var(--accent);
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  footer {
+    text-align: center; color: var(--label); font-size: 12.5px;
+    margin-top: 36px; padding-top: 22px; border-top: 1px solid var(--sep);
+  }
+</style>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1 class="logo">poppn</h1>
+    <div class="rule"></div>
+    <p class="tag">WiFi Packet Monitor &amp; Deauth Detector</p>
+    <p class="sub">LilyGO T-Dongle S3 &nbsp;·&nbsp; ESP32-S3 &nbsp;·&nbsp; v3</p>
+  </header>
+
+  <section class="panel flash">
+    <h2>Flash from your browser</h2>
+    <esp-web-install-button manifest="manifest.json">
+      <button class="btn" slot="activate">⚡ Install poppn packmon</button>
+      <div slot="unsupported" class="unsupported">
+        <b>Browser not supported.</b> Web Serial is required — use desktop Chrome, Edge or Opera.
+        Firefox and Safari cannot flash devices.
+      </div>
+      <div slot="not-allowed" class="unsupported">
+        <b>HTTPS required.</b> Open this page over https:// to flash.
+      </div>
+    </esp-web-install-button>
+    <p class="hint">No install, no toolchain — plug the dongle in and click.</p>
+  </section>
+
+  <section class="panel">
+    <h2>How to flash</h2>
+    <ol class="steps">
+      <li>Hold the <b>BOOT</b> button on the dongle, plug it into a USB port, then release.</li>
+      <li>Click <b>Install poppn packmon</b> above.</li>
+      <li>Pick the serial port in the browser dialog (<code>USB JTAG/serial debug unit</code> or a COM/ttyACM port).</li>
+      <li>Choose <b>Install</b>, confirm the erase, and wait ~30&nbsp;s.</li>
+      <li>Unplug and replug. The splash animation means you're done.</li>
+    </ol>
+  </section>
+
+  <section class="panel">
+    <h2>What it does</h2>
+    <ul class="feat">
+      <li>Promiscuous 802.11 sniffing across channels 1–13, hopping every 500&nbsp;ms.</li>
+      <li>Live packet-rate graph on the 0.96" ST7735 display, with gradient history.</li>
+      <li>Deauth / disassoc detection — full-screen red alert, flashing border and LED.</li>
+      <li>Reports attacker MAC, channel and RSSI on screen and over serial.</li>
+      <li>Running totals for packets seen and deauth frames caught.</li>
+      <li>APA102 status LED: breathing cyan when idle, strobing red on attack.</li>
+    </ul>
+  </section>
+
+  <section class="panel">
+    <h2>Specs</h2>
+    <table>
+      <tr><td class="k">Board</td><td class="v">LilyGO T-Dongle S3 (ESP32-S3)</td></tr>
+      <tr><td class="k">Display</td><td class="v">ST7735 160×80, SPI @ 27 MHz</td></tr>
+      <tr><td class="k">Channel hop</td><td class="v">500 ms, channels 1–13</td></tr>
+      <tr><td class="k">Graph window</td><td class="v">120 samples @ 200 ms ≈ 24 s</td></tr>
+      <tr><td class="k">Alert hold</td><td class="v">5 s after last deauth frame</td></tr>
+      <tr><td class="k">Serial log</td><td class="v">115200 baud, USB CDC</td></tr>
+      <tr><td class="k">Flash image</td><td class="v">merged, 8 MB layout, offset 0x0</td></tr>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>Legal</h2>
+    <p class="note">
+      <b>Receive-only.</b> packmon listens; it never transmits deauth frames or any other attack traffic.
+      Passively monitoring radio spectrum is still regulated in some jurisdictions — check your local law
+      before running it, and only monitor networks you own or are authorised to test.
+    </p>
+  </section>
+
+  <footer>
+    Source, schematics and build instructions on
+    <a href="https://github.com/poppnn/tdongle-s3-packmon">GitHub</a> · MIT licence
+  </footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "poppn packmon",
+  "version": "3.0.0",
+  "home_assistant_domain": null,
+  "funding_url": null,
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/poppn-packmon.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
