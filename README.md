@@ -13,12 +13,38 @@ attacker's MAC, channel and RSSI the moment it sees a deauth or disassoc frame.
 ## Features
 
 - Promiscuous 802.11 capture on channels 1–13, hopping every 500 ms
-- Live packet-rate graph (120 samples @ 200 ms ≈ 24 s window) with gradient history
-- Deauth / disassoc detection: full-screen red alert, flashing border, strobing LED
-- Attacker source MAC, destination MAC, channel and RSSI reported on screen and over serial
-- Running counters for total packets and deauth frames
-- APA102 status LED — breathing cyan when idle, red strobe under attack
-- Animated boot splash
+- Five pages cycled with the dongle's own button — nothing to configure
+- Deauth / disassoc detection: full-screen alert over any page, strobing LED, serial log
+- Beacon parsing builds a live table of nearby networks (SSID, channel, encryption, RSSI)
+- Per-channel activity bars so you can see which channel the noise is on
+- Channel lock to stop hopping and stare at one channel
+- APA102 status LED shifts colour with traffic load, red strobe under attack
+- Rendered through a framebuffer at ~30 fps: no flicker, animated transitions throughout
+
+## Pages
+
+| Page | Shows |
+|---|---|
+| **LIVE** | packets/sec, total packets, deauth count, 30 s rate graph |
+| **CHANNELS** | activity bar per channel 1–13, busiest channel and its share |
+| **NETWORKS** | nearby APs sorted by signal — SSID, lock, channel, RSSI bars |
+| **THREATS** | deauth total and the last three events with MAC, channel, RSSI, age |
+| **SYSTEM** | uptime, packet total, network count, mgmt/data split, free RAM, fps |
+
+Every page carries the current channel and live RSSI in its header.
+
+## Controls
+
+The dongle's BOOT button is the only control:
+
+| Action | Effect |
+|---|---|
+| Tap | next page |
+| Hold ~0.6 s | lock / unlock the current channel |
+| Keep holding to 2.5 s | clear all counters and tables |
+
+A progress bar along the bottom edge fills while you hold, so you can see which
+threshold you are about to cross.
 
 ## Hardware
 
@@ -58,20 +84,31 @@ pio device monitor
 
 ## Serial output
 
-115200 baud over USB CDC. Each detection prints:
+115200 baud over USB CDC. Every detection prints immediately:
 
 ```
 [DEAUTH] #7  src=AA:BB:CC:DD:EE:FF  dst=FF:FF:FF:FF:FF:FF  ch=6  rssi=-42 dBm
 ```
 
-## Reading the display
+and a heartbeat lands every 10 s, so a host can log the run without watching the screen:
 
-**Normal view** — header shows current channel and last RSSI; the green graph is packet rate over
-the last ~24 s with the peak value on the left axis; below it, total packets and deauth count; the
-bottom line shows the last attacker's MAC suffix, channel and signal strength.
+```
+[stat] pkts=48213 (mgmt=9120 ctrl=6034 data=33059 beacon=8871) deauth=0 aps=14 rate=412/s ch=9 dropped=0 heap=241184
+```
 
-**Alert view** — triggered for 5 s after each deauth frame: flashing red border, large RSSI readout
-(how close the attacker is), channel, and the full source MAC.
+## How it works
+
+The promiscuous callback runs in the WiFi task and stays short: it bumps counters and pushes
+richer frames (beacons, deauths) into a single-producer ring buffer. `loop()` drains that ring,
+so the network and threat tables are only ever touched from one task and need no locking. If the
+ring fills under heavy traffic, events are dropped rather than blocking the radio — the count
+shows up as `dropped` in the heartbeat.
+
+The UI draws into a 160×80 framebuffer (25 KB) and flushes it once per frame. That is what makes
+animation possible at all: partial redraws straight to the panel flicker, a single flush does not.
+
+A deauth frame takes over the screen for 5 s regardless of which page you are on, with a shrinking
+bar showing when it will hand the page back.
 
 ## Rebuilding the web flasher image
 

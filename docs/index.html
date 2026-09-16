@@ -149,7 +149,7 @@
     <h1 class="logo">poppn</h1>
     <div class="rule"></div>
     <p class="tag">WiFi Packet Monitor &amp; Deauth Detector</p>
-    <p class="sub">LilyGO T-Dongle S3 &nbsp;·&nbsp; ESP32-S3 &nbsp;·&nbsp; v3</p>
+    <p class="sub">LilyGO T-Dongle S3 &nbsp;·&nbsp; ESP32-S3 &nbsp;·&nbsp; v4</p>
   </header>
 
   <section class="panel flash">
@@ -182,12 +182,25 @@
     <h2>What it does</h2>
     <ul class="feat">
       <li>Promiscuous 802.11 sniffing across channels 1–13, hopping every 500&nbsp;ms.</li>
-      <li>Live packet-rate graph on the 0.96" ST7735 display, with gradient history.</li>
-      <li>Deauth / disassoc detection — full-screen red alert, flashing border and LED.</li>
-      <li>Reports attacker MAC, channel and RSSI on screen and over serial.</li>
-      <li>Running totals for packets seen and deauth frames caught.</li>
-      <li>APA102 status LED: breathing cyan when idle, strobing red on attack.</li>
+      <li><b>Five pages</b> you cycle with the dongle's button — no config, no app.</li>
+      <li><b>Live</b> — packets per second, running totals and a 30&nbsp;s rate graph.</li>
+      <li><b>Channels</b> — activity bars for all 13 channels, busiest one called out.</li>
+      <li><b>Networks</b> — nearby APs with SSID, channel, encryption and signal.</li>
+      <li><b>Threats</b> — deauth log with attacker MAC, channel, RSSI and age.</li>
+      <li><b>System</b> — uptime, frame-type breakdown, free RAM and frame rate.</li>
+      <li>Deauth / disassoc detection interrupts any page with a full-screen alert.</li>
+      <li>Everything renders through a framebuffer at 30&nbsp;fps — no flicker, animated throughout.</li>
+      <li>APA102 status LED shifts colour with traffic load, strobes red on attack.</li>
     </ul>
+  </section>
+
+  <section class="panel">
+    <h2>Controls</h2>
+    <table>
+      <tr><td class="k">Tap the button</td><td class="v">next page</td></tr>
+      <tr><td class="k">Hold ~0.6 s</td><td class="v">lock the current channel (stop hopping)</td></tr>
+      <tr><td class="k">Keep holding to 2.5 s</td><td class="v">clear all counters</td></tr>
+    </table>
   </section>
 
   <section class="panel">
@@ -195,8 +208,10 @@
     <table>
       <tr><td class="k">Board</td><td class="v">LilyGO T-Dongle S3 (ESP32-S3)</td></tr>
       <tr><td class="k">Display</td><td class="v">ST7735 160×80, SPI @ 27 MHz</td></tr>
+      <tr><td class="k">Rendering</td><td class="v">25 KB framebuffer, ~30 fps</td></tr>
       <tr><td class="k">Channel hop</td><td class="v">500 ms, channels 1–13</td></tr>
-      <tr><td class="k">Graph window</td><td class="v">120 samples @ 200 ms ≈ 24 s</td></tr>
+      <tr><td class="k">Graph window</td><td class="v">152 samples @ 200 ms ≈ 30 s</td></tr>
+      <tr><td class="k">Network table</td><td class="v">24 APs, aged out after 2 min</td></tr>
       <tr><td class="k">Alert hold</td><td class="v">5 s after last deauth frame</td></tr>
       <tr><td class="k">Serial log</td><td class="v">115200 baud, USB CDC</td></tr>
       <tr><td class="k">Flash image</td><td class="v">merged, 8 MB layout, offset 0x0</td></tr>
