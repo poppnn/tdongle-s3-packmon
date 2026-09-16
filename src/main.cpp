@@ -85,11 +85,6 @@ bool was_alert = false;
 #define C_ACCENT   0x4C7F
 #define C_SEP      0x2124
 
-// Smooth gradient: 8 shades from dim to bright green
-static const uint16_t grad_green[8] = {
-    0x0160, 0x01C0, 0x0260, 0x0320, 0x03E0, 0x0500, 0x0620, 0x07E0
-};
-
 // ─── Helpers ───────────────────────────────────────────────────────────────
 static String mac2str(const volatile uint8_t *mac) {
     char buf[18];
@@ -98,13 +93,22 @@ static String mac2str(const volatile uint8_t *mac) {
     return String(buf);
 }
 
+// Continuous dim-to-bright green gradient across `span` pixels.
+// Interpolates over the full 6-bit green channel (RGB565) so neighbouring
+// pixels never jump more than one shade — no visible banding.
+static uint16_t grad_green_at(int pos, int span) {
+    const int G_DIM = 11, G_BRIGHT = 63;
+    if (span < 2) return (uint16_t)(G_BRIGHT << 5);
+    if (pos < 0) pos = 0;
+    if (pos > span - 1) pos = span - 1;
+    int last = span - 1;
+    int g = G_DIM + ((G_BRIGHT - G_DIM) * pos + last / 2) / last;
+    return (uint16_t)(g << 5);
+}
+
 static uint16_t graph_color(int pos) {
     // pos 0 = oldest, GRAPH_W-1 = newest
-    // map to 8 gradient steps
-    int step = (pos * 7) / (GRAPH_W - 1);
-    if (step < 0) step = 0;
-    if (step > 7) step = 7;
-    return grad_green[step];
+    return grad_green_at(pos, GRAPH_W);
 }
 
 // ─── Promiscuous callback ──────────────────────────────────────────────────
@@ -369,7 +373,7 @@ void splash_screen() {
     gfx->drawRect(bar_x - 1, bar_y - 1, bar_w + 2, 6, C_SEP);
 
     for (int i = 0; i < bar_w; i++) {
-        uint16_t c = graph_color((i * (GRAPH_W - 1)) / bar_w);
+        uint16_t c = grad_green_at(i, bar_w);
         gfx->drawFastVLine(bar_x + i, bar_y, 4, c);
         // LED breathes during loading
         uint8_t br = (uint8_t)(15 + 15 * sin(i * 0.1));

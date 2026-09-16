@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', 'README.md', 'LICENSE']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build
+        run: pio run
+
+      - name: Merge flash image
+        run: |
+          pip install esptool
+          BUILD=.pio/build/lilygo-t-dongle-s3
+          BOOT_APP0=$(find ~/.platformio/packages -name boot_app0.bin | head -1)
+          esptool.py --chip esp32s3 merge_bin -o poppn-packmon.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 8MB \
+            0x0     "$BUILD/bootloader.bin" \
+            0x8000  "$BUILD/partitions.bin" \
+            0xe000  "$BOOT_APP0" \
+            0x10000 "$BUILD/firmware.bin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: poppn-packmon-firmware
+          path: poppn-packmon.bin
