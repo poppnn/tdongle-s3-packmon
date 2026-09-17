@@ -149,7 +149,7 @@
     <h1 class="logo">poppn</h1>
     <div class="rule"></div>
     <p class="tag">WiFi Packet Monitor &amp; Deauth Detector</p>
-    <p class="sub">LilyGO T-Dongle S3 &nbsp;·&nbsp; ESP32-S3 &nbsp;·&nbsp; v5</p>
+    <p class="sub">LilyGO T-Dongle S3 &nbsp;·&nbsp; ESP32-S3 &nbsp;·&nbsp; v6</p>
   </header>
 
   <section class="panel flash">
@@ -182,7 +182,7 @@
     <h2>What it does</h2>
     <ul class="feat">
       <li>Promiscuous 802.11 sniffing across channels 1–13, hopping every 500&nbsp;ms.</li>
-      <li><b>Five pages</b> you cycle with the dongle's button — no config, no app.</li>
+      <li><b>Six pages</b> you cycle with the dongle's button — no config, no app.</li>
       <li><b>Live</b> — packets per second, running totals and a 30&nbsp;s rate graph.</li>
       <li><b>Channels</b> — activity bars for all 13 channels, busiest one called out.</li>
       <li><b>Networks</b> — nearby APs with SSID, channel, encryption and signal.</li>
@@ -191,6 +191,7 @@
       <li>Deauth / disassoc detection interrupts any page with a full-screen alert, then drops you on <b>Threats</b> automatically.</li>
       <li><b>SD logging</b> — insert a microSD before power-on and every session is appended to readable CSVs under <code>packmon-logs/</code>, building one combined dataset.</li>
       <li><b>Handshake capture</b> — EAPOL frames are saved as a <code>.pcap</code> in <code>packmon-logs/</code> when a card is present.</li>
+      <li><b>USB drive</b> — mount the SD card straight onto your PC or phone from the USB page; no card removal, no reader.</li>
       <li>Everything renders through a framebuffer at 30&nbsp;fps — no flicker, animated throughout.</li>
       <li>APA102 status LED shifts colour with traffic load, strobes red on attack.</li>
     </ul>
@@ -229,7 +230,22 @@
       <tr><td class="k">Tap the button</td><td class="v">next page</td></tr>
       <tr><td class="k">Hold ~0.6 s</td><td class="v">lock the current channel (stop hopping)</td></tr>
       <tr><td class="k">Keep holding to 2.5 s</td><td class="v">clear all counters</td></tr>
+      <tr><td class="k">Hold on the USB page</td><td class="v">mount / eject the SD card as a USB drive</td></tr>
     </table>
+  </section>
+
+  <section class="panel">
+    <h2>Read the card over USB</h2>
+    <p style="color:var(--label);font-size:13.5px;margin:0 0 12px;">
+      No need to pop the microSD out. Open the <b style="color:var(--text)">USB</b> page and hold the button:
+      the card mounts on your computer or phone as a normal USB drive, so you can copy off
+      <code>packmon-logs/</code> (and drop the CSVs straight into the
+      <a href="viewer.html" style="color:var(--accent)">viewer</a>). Hold again to eject.
+    </p>
+    <p class="note">
+      <b>Logging pauses while mounted</b> — the host owns the card, so packmon stops writing until you eject.
+      The dongle also always appears as a small serial device; that's the debug console, not the drive.
+    </p>
   </section>
 
   <section class="panel">

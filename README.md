@@ -13,13 +13,14 @@ attacker's MAC, channel and RSSI the moment it sees a deauth or disassoc frame.
 ## Features
 
 - Promiscuous 802.11 capture on channels 1–13, hopping every 500 ms
-- Five pages cycled with the dongle's own button — nothing to configure
+- Six pages cycled with the dongle's own button — nothing to configure
 - Deauth / disassoc detection: full-screen alert over any page, strobing LED, serial log
 - Beacon parsing builds a live table of nearby networks (SSID, channel, encryption, RSSI)
 - Per-channel activity bars so you can see which channel the noise is on
 - Channel lock to stop hopping and stare at one channel
-- **SD logging** — readable CSV logs per session, enabled automatically when a card is present at boot
+- **SD logging** — readable CSV logs, appended across boots, enabled automatically when a card is present
 - **Handshake capture** — EAPOL frames saved as standard `.pcap` for Wireshark / hashcat
+- **USB Mass Storage** — mount the SD card on a PC or phone straight from the dongle, no reader needed
 - **[Browser log viewer](https://poppnn.github.io/tdongle-s3-packmon/viewer.html)** — turns the CSVs into spider charts and timelines
 - APA102 status LED shifts colour with traffic load, red strobe under attack
 - Rendered through a framebuffer at ~30 fps: no flicker, animated transitions throughout
@@ -33,6 +34,7 @@ attacker's MAC, channel and RSSI the moment it sees a deauth or disassoc frame.
 | **NETWORKS** | nearby APs sorted by signal — SSID, lock, channel, RSSI bars |
 | **THREATS** | deauth total and the last three events with MAC, channel, RSSI, age |
 | **SYSTEM** | uptime, packet total, network count, mgmt/data split, free RAM, fps |
+| **USB** | mount the SD card as a USB drive on a PC / phone |
 
 Every page carries the current channel and live RSSI in its header.
 
@@ -45,6 +47,7 @@ The dongle's BOOT button is the only control:
 | Tap | next page |
 | Hold ~0.6 s | lock / unlock the current channel |
 | Keep holding to 2.5 s | clear all counters and tables |
+| Hold on the **USB** page | mount / eject the SD card as a USB drive |
 
 A progress bar along the bottom edge fills while you hold, so you can see which
 threshold you are about to cross.
@@ -161,6 +164,21 @@ hashcat -m 22000 handshake.22000 wordlist.txt
 Capture is best-effort: channel hopping means you only catch a handshake if the dongle is on that
 network's channel when a device (re)connects — **lock the channel** (hold the button) on the target
 to raise your odds. This is receive-only; packmon never sends deauth frames to force a reconnect.
+
+## USB Mass Storage
+
+Rather than pull the microSD out, you can read it directly over the dongle's USB port. Open the
+**USB** page and hold the button: the card mounts on your computer or phone as an ordinary USB drive.
+Copy off `packmon-logs/`, drop the CSVs into the viewer, then hold again to eject.
+
+- **Logging pauses while mounted.** The host owns the filesystem, so packmon closes its log files and
+  stops writing until you eject; on eject it remounts and resumes as a new session (appended to the
+  same files). Sector reads/writes from the host go straight to the card via the ESP-IDF sdmmc driver.
+- This needs TinyUSB, so the firmware builds with `ARDUINO_USB_MODE=0` and starts USB manually in
+  `setup()` (CDC for the serial console + the Mass-Storage interface). The dongle therefore always
+  enumerates as a **composite device**: a small serial port (the debug console) plus a card reader
+  that shows "no media" until you mount it.
+- Flashing is unaffected — hold **BOOT** while plugging in to enter the ROM bootloader as usual.
 
 ## Log viewer
 

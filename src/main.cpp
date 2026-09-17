@@ -6,6 +6,17 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #include <stdarg.h>
+#include "USB.h"
+#include "USBCDC.h"
+#include "USBMSC.h"
+#include "driver/sdmmc_host.h"
+#include "sdmmc_cmd.h"
+
+// TinyUSB CDC serial (USB_MODE=0, CDC not started on boot). Registered and
+// started manually in setup() so the Mass-Storage interface can be added
+// alongside it. Debug output goes here instead of the hardware UART.
+USBCDC USBSerial;
+#define Serial USBSerial
 
 // ─── Pin config (official LilyGO T-Dongle S3) ─────────────────────────────
 #define PIN_MOSI  3
@@ -115,6 +126,17 @@ static int     hs_track_n = 0;
 
 static bool sd_ok = false;   // decided once, during the boot splash
 
+// ─── USB Mass Storage ──────────────────────────────────────────────────────
+// On demand, the card is handed to the host (PC/phone) as a USB drive. While
+// mounted, packmon stops touching the card (logging paused) and the host owns
+// the filesystem; sector reads/writes go straight to the card via the IDF
+// sdmmc driver. Toggled from the USB page.
+static USBMSC  msc;
+static bool    msc_registered = false;  // MSC interface present in USB descriptor
+static volatile bool msc_mode = false;  // card currently exposed to the host
+static sdmmc_card_t *msc_card = nullptr;
+static volatile uint32_t msc_rd = 0, msc_wr = 0, msc_act_ts = 0;
+
 // ─── Event queue ───────────────────────────────────────────────────────────
 // The promiscuous callback stays short: it bumps counters and hands richer
 // frames to the UI task through a single-producer ring, so the tables below
@@ -165,8 +187,8 @@ static threat_t threats[MAX_THREATS];
 static int threat_count = 0, threat_next = 0;
 
 // ─── UI state ──────────────────────────────────────────────────────────────
-enum { PAGE_LIVE, PAGE_CHANNELS, PAGE_NETWORKS, PAGE_THREATS, PAGE_SYSTEM, PAGE_COUNT };
-static const char *PAGE_NAME[PAGE_COUNT] = { "LIVE", "CHANNELS", "NETWORKS", "THREATS", "SYSTEM" };
+enum { PAGE_LIVE, PAGE_CHANNELS, PAGE_NETWORKS, PAGE_THREATS, PAGE_SYSTEM, PAGE_USB, PAGE_COUNT };
+static const char *PAGE_NAME[PAGE_COUNT] = { "LIVE", "CHANNELS", "NETWORKS", "THREATS", "SYSTEM", "USB" };
 
 static int   page = PAGE_LIVE, page_from = PAGE_LIVE;
 static int   slide_dir = 1;
@@ -422,6 +444,77 @@ static bool sd_init() {
 
     log_dirty = true;
     return f_events && f_stats;
+}
+
+// ─── USB Mass Storage ──────────────────────────────────────────────────────
+// Host block I/O goes straight to the card. These run in the TinyUSB task, so
+// they only touch msc_card (valid only while msc_mode is true) and counters.
+static int32_t on_msc_read(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
+    if (!msc_card) return -1;
+    uint32_t ss = msc_card->csd.sector_size;
+    if (sdmmc_read_sectors(msc_card, buffer, lba + offset / ss, bufsize / ss) != ESP_OK) return -1;
+    msc_rd++; msc_act_ts = millis();
+    return bufsize;
+}
+static int32_t on_msc_write(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
+    if (!msc_card) return -1;
+    uint32_t ss = msc_card->csd.sector_size;
+    if (sdmmc_write_sectors(msc_card, buffer, lba + offset / ss, bufsize / ss) != ESP_OK) return -1;
+    msc_wr++; msc_act_ts = millis();
+    return bufsize;
+}
+static bool on_msc_startstop(uint8_t, bool, bool) { return true; }
+
+// Bring up a raw sdmmc card handle for sector access (1-bit, same pins).
+static bool sd_raw_open() {
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = 20000;
+    host.flags = SDMMC_HOST_FLAG_1BIT;
+    if (sdmmc_host_init() != ESP_OK) return false;
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.width = 1;
+    slot.clk = (gpio_num_t)PIN_SD_CLK;
+    slot.cmd = (gpio_num_t)PIN_SD_CMD;
+    slot.d0  = (gpio_num_t)PIN_SD_D0;
+    if (sdmmc_host_init_slot(SDMMC_HOST_SLOT_1, &slot) != ESP_OK) { sdmmc_host_deinit(); return false; }
+    msc_card = (sdmmc_card_t *)malloc(sizeof(sdmmc_card_t));
+    if (!msc_card) { sdmmc_host_deinit(); return false; }
+    if (sdmmc_card_init(&host, msc_card) != ESP_OK) {
+        free(msc_card); msc_card = nullptr; sdmmc_host_deinit(); return false;
+    }
+    return true;
+}
+
+// Enter USB-drive mode: close logs, release the Arduino mount, hand the raw
+// card to the host. Logging is off (sd_ok false) until we exit.
+static bool msc_enter() {
+    if (msc_mode || !msc_registered) return false;
+    log_flush();
+    if (f_events) f_events.close();
+    if (f_nets)   f_nets.close();
+    if (f_stats)  f_stats.close();
+    if (f_hs)     f_hs.close();
+    sd_ok = false;
+    SD_MMC.end();
+    if (!sd_raw_open()) { sd_ok = sd_init(); return false; }  // recover on failure
+    msc_rd = msc_wr = 0;
+    msc.mediaPresent(true);
+    msc_mode = true;
+    Serial.println("[usb] mass storage mode on");
+    return true;
+}
+
+// Leave USB-drive mode: hide media from the host, release the raw card, remount
+// for logging (as a fresh session, appended to the same files).
+static void msc_exit() {
+    if (!msc_mode) return;
+    msc.mediaPresent(false);
+    msc_mode = false;
+    delay(50);                       // let any in-flight host op finish
+    if (msc_card) { free(msc_card); msc_card = nullptr; }
+    sdmmc_host_deinit();
+    sd_ok = sd_init();
+    Serial.println("[usb] mass storage mode off");
 }
 
 // ─── Text helpers ──────────────────────────────────────────────────────────
@@ -964,6 +1057,53 @@ static void page_system(int ox) {
           "%uK %uf", ESP.getFreeHeap() / 1024, fps);
 }
 
+// ─── Page: USB (mass storage) ──────────────────────────────────────────────
+static void page_usb(int ox) {
+    draw_header(ox, PAGE_NAME[PAGE_USB]);
+
+    if (msc_mode) {
+        // Big, unambiguous "you can read the card now" state.
+        bool active = (millis() - msc_act_ts) < 400;
+        float pulse = 0.5f + 0.5f * sinf(millis() * 0.006f);
+        txt_c(ox + SCR_W / 2, 18, lerp565(C_BLUE, C_TEXT, pulse), 2, "USB DRIVE");
+        txt_c(ox + SCR_W / 2, 37, active ? C_ACCENT : C_LABEL, 1,
+              active ? "host is reading/writing" : "mounted on host");
+
+        // Read/write activity counters.
+        txt(ox + 8, 49, C_LABEL, 1, "RD");
+        txt(ox + 26, 49, C_TEXT, 1, "%u", msc_rd);
+        txt_r(ox + SCR_W - 8, 49, C_LABEL, 1, "WR %u", msc_wr);
+
+        // Live blocks, blue while active.
+        int cx = ox + SCR_W / 2, bx = cx - 30;
+        for (int i = 0; i < 6; i++) {
+            bool on = active && (((millis() / 90) % 6) == (uint32_t)i);
+            gfx->fillRect(bx + i * 10, 60, 7, 4, on ? C_BLUE : C_SEP);
+        }
+        txt_c(ox + SCR_W / 2, 67, C_WARN, 1, "hold btn to eject");
+        return;
+    }
+
+    if (!sd_ok && !msc_registered) {
+        txt_c(ox + SCR_W / 2, 30, C_SEP, 1, "no card detected");
+        txt_c(ox + SCR_W / 2, 42, C_LABEL, 1, "insert one and reboot");
+        return;
+    }
+
+    txt(ox + 4, 16, C_LABEL, 1, "Mount the card as a USB");
+    txt(ox + 4, 26, C_LABEL, 1, "drive on your PC or phone.");
+
+    uint64_t mb = SD_MMC.cardSize() / (1024ULL * 1024ULL);
+    txt(ox + 4, 40, C_LABEL, 1, "CARD");
+    if (mb >= 1024) txt_r(ox + SCR_W - 4, 40, C_TEXT, 1, "%.1f GB", mb / 1024.0f);
+    else            txt_r(ox + SCR_W - 4, 40, C_TEXT, 1, "%u MB", (uint32_t)mb);
+
+    txt(ox + 4, 50, C_LABEL, 1, "LOGGING");
+    txt_r(ox + SCR_W - 4, 50, C_WARN, 1, "pauses while mounted");
+
+    txt_c(ox + SCR_W / 2, 66, C_ACCENT, 1, "hold btn to mount");
+}
+
 // ─── Deauth alert overlay ──────────────────────────────────────────────────
 static void render_alert() {
     uint32_t age = millis() - alert_ts;
@@ -1000,6 +1140,7 @@ static void draw_page(int p, int ox) {
         case PAGE_NETWORKS: page_networks(ox); break;
         case PAGE_THREATS:  page_threats(ox);  break;
         case PAGE_SYSTEM:   page_system(ox);   break;
+        case PAGE_USB:      page_usb(ox);      break;
     }
 }
 
@@ -1133,8 +1274,6 @@ static void goto_page(int p) {
 // ─── Setup ─────────────────────────────────────────────────────────────────
 void setup() {
     delay(300);
-    Serial.begin(115200);
-    Serial.println("[poppn] Starting...");
 
     pinMode(PIN_BTN, INPUT_PULLUP);
 
@@ -1156,7 +1295,26 @@ void setup() {
     pinMode(PIN_BL, OUTPUT);
     digitalWrite(PIN_BL, LOW);
 
-    splash_screen();
+    splash_screen();   // probes the card, sets sd_ok / log_session
+
+    // USB composite: CDC (serial) always, plus a Mass-Storage interface when a
+    // card is present. Both interfaces must be registered before USB.begin(),
+    // which is why CDC is not started on boot. MSC starts with no media; the
+    // card is only exposed once the user mounts it from the USB page.
+    USBSerial.begin(115200);
+    if (sd_ok) {
+        uint32_t sectors = (uint32_t)(SD_MMC.cardSize() / 512ULL);
+        msc.vendorID("poppn");
+        msc.productID("packmon SD");
+        msc.productRevision("1.0");
+        msc.onRead(on_msc_read);
+        msc.onWrite(on_msc_write);
+        msc.onStartStop(on_msc_startstop);
+        msc.mediaPresent(false);
+        msc_registered = msc.begin(sectors, 512);
+    }
+    USB.begin();
+    Serial.println("[poppn] Starting...");
 
     boot_ms = millis();
     fps_ts = rate_window_ts = boot_ms;
@@ -1219,7 +1377,8 @@ void loop() {
         }
     }
 
-    // Button: tap = next page, hold = lock channel, keep holding = reset
+    // Button: tap = next page, hold = lock channel, keep holding = reset.
+    // On the USB page the hold instead toggles mass-storage mode.
     bool down = (digitalRead(PIN_BTN) == LOW);
     uint32_t held = 0;
     if (down && !btn_down) {
@@ -1229,18 +1388,26 @@ void loop() {
         held = now - btn_t0;
         if (held >= HOLD_LOCK_MS && !fired_lock) {
             fired_lock = true;
-            ch_lock = !ch_lock;
-            toast(ch_lock ? "CHANNEL LOCKED" : "HOPPING RESUMED");
+            if (page == PAGE_USB) {
+                if (msc_mode)            { msc_exit(); toast("USB EJECTED"); }
+                else if (msc_registered) { toast(msc_enter() ? "USB DRIVE ON" : "USB FAILED"); }
+                else                       toast("NO CARD");
+            } else {
+                ch_lock = !ch_lock;
+                toast(ch_lock ? "CHANNEL LOCKED" : "HOPPING RESUMED");
+            }
         }
-        if (held >= HOLD_RESET_MS && !fired_reset) {
+        // No stats reset on the USB page — the hold there means eject/mount.
+        if (held >= HOLD_RESET_MS && !fired_reset && page != PAGE_USB) {
             fired_reset = true;
             reset_stats();
             toast("STATS CLEARED");
         }
     } else if (btn_down) {
-        // Taps are swallowed while the alert owns the screen, otherwise they
-        // would shuffle a page nobody can see and fight the jump below.
-        if (now - btn_t0 < HOLD_LOCK_MS && !alert_on) goto_page(page + 1);
+        // Taps are swallowed while the alert owns the screen, or while the card
+        // is mounted (the USB status must stay put), otherwise they would
+        // shuffle a page nobody can see and fight the jump below.
+        if (now - btn_t0 < HOLD_LOCK_MS && !alert_on && !msc_mode) goto_page(page + 1);
         btn_down = false;
     }
 
@@ -1273,7 +1440,11 @@ void loop() {
     static uint32_t last_led = 0;
     if (now - last_led >= 20) {
         last_led = now;
-        if (alert_on) {
+        if (msc_mode) {
+            // Blue for USB-drive mode; brief white flash on host access.
+            if (millis() - msc_act_ts < 120) led_set(60, 60, 60);
+            else { uint8_t b = (uint8_t)(6 + 18 * (0.5f + 0.5f * sinf(now * 0.004f))); led_set(0, 0, b); }
+        } else if (alert_on) {
             led_set(((now / 150) % 2) ? 90 : 0, 0, 0);
         } else {
             float b = 8.0f + 10.0f * (0.5f + 0.5f * sinf(now * 0.003f));
