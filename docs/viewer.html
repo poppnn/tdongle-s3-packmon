@@ -70,6 +70,11 @@
   .badge{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;font-weight:700;}
   .badge.ok{background:rgba(33,206,33,.16);color:var(--ok);}
   .badge.part{background:rgba(255,161,0,.16);color:var(--warn);}
+  .sessbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:18px;}
+  .sessbar .lbl{color:var(--label);font-size:11px;letter-spacing:.12em;text-transform:uppercase;margin-right:2px;}
+  .chip{padding:5px 12px;border-radius:20px;border:1px solid var(--sep);background:var(--panel);color:var(--label);font-family:var(--mono);font-size:12px;font-weight:700;cursor:pointer;transition:all .12s;}
+  .chip:hover{border-color:var(--accent-d);color:var(--text);}
+  .chip.on{background:rgba(0,255,189,.16);border-color:var(--accent-d);color:var(--accent);}
   .hs-note{border-left:2px solid var(--accent-d);background:rgba(0,255,189,.05);padding:12px 16px;border-radius:0 8px 8px 0;font-size:12.5px;color:#b9c2be;margin-top:18px;}
   code{background:var(--panel2);border:1px solid var(--sep);border-radius:4px;padding:1px 5px;color:var(--accent);font-size:12px;}
   footer{text-align:center;color:var(--label);font-size:12px;margin-top:34px;padding-top:20px;border-top:1px solid var(--sep);}
@@ -96,6 +101,7 @@
   </div>
 
   <div id="dash">
+    <div class="sessbar" id="sessbar" style="display:none;"></div>
     <div class="cards" id="cards"></div>
 
     <div class="grid2">
@@ -180,6 +186,16 @@ function bySession(rows){
   rows.forEach(r=>{ const k=sess(r); if(!(k in g)){ g[k]=[]; order.push(k); } g[k].push(r); });
   return order.map(k=>({ id:k, rows:g[k] }));
 }
+
+// Which sessions the data holds, and which are currently selected. Selecting
+// one isolates it; selecting several (or all) joins their data.
+let activeSessions = new Set();
+function allSessionIds(){
+  const ids = new Set();
+  ['events','networks','stats'].forEach(k=>(store[k]||[]).forEach(r=>ids.add(sess(r))));
+  return [...ids].sort((a,b)=>(+a||a)-(+b||b) || (a<b?-1:1));
+}
+const inSel = r => activeSessions.has(sess(r));
 
 // ── pcap parsing (client-side, no upload) ────────────────────────────────────
 const mac = (dv,o)=>{ let s=[]; for(let i=0;i<6;i++) s.push(dv.getUint8(o+i).toString(16).padStart(2,'0')); return s.join(':'); };
@@ -293,7 +309,35 @@ function done(got){
   if(got.includes('pcap')) have.push(hs.files+' pcap');
   document.getElementById('loaded').innerHTML =
     have.length ? 'loaded: <b>'+have.join('</b>, <b>')+'</b>' : 'no recognised packmon files in that selection';
+  activeSessions = new Set(allSessionIds());   // start with everything joined
+  buildSessionBar();
   if(have.length || hs.frames) render();
+}
+
+// Chip row: "All" plus one chip per session. Multi-select — the render reads
+// only the selected sessions, so one chip = isolated, several = joined.
+function buildSessionBar(){
+  const bar = document.getElementById('sessbar');
+  const ids = allSessionIds();
+  if(ids.length < 2){ bar.style.display='none'; return; }   // nothing to separate
+  bar.style.display='flex';
+
+  const allOn = ids.every(id=>activeSessions.has(id));
+  let html = '<span class="lbl">Sessions</span>';
+  html += `<button class="chip ${allOn?'on':''}" data-id="__all">All</button>`;
+  html += ids.map(id=>`<button class="chip ${activeSessions.has(id)?'on':''}" data-id="${id}">s${id}</button>`).join('');
+  bar.innerHTML = html;
+
+  bar.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{
+    const id = c.dataset.id;
+    if(id==='__all'){ activeSessions = new Set(ids); }
+    else {
+      if(activeSessions.has(id)) activeSessions.delete(id); else activeSessions.add(id);
+      if(activeSessions.size===0) activeSessions = new Set(ids);  // never empty
+    }
+    buildSessionBar();
+    render();
+  });
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────────
@@ -303,7 +347,11 @@ function num(v){ v=+v||0; return v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).to
 function render(){
   destroyCharts();
   document.getElementById('dash').style.display='block';
-  const st = store.stats||[], ev = store.events||[], nets = store.networks||[];
+  // Only the selected sessions feed the charts and tables. With every chip on
+  // this is the full combined dataset; with one chip it is that boot alone.
+  const st = (store.stats||[]).filter(inSel),
+        ev = (store.events||[]).filter(inSel),
+        nets = (store.networks||[]).filter(inSel);
 
   // The stats counters are cumulative *within* a boot and reset to zero on the
   // next one, so to combine appended sessions we take each session's final row

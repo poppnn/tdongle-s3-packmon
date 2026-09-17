@@ -178,8 +178,12 @@ renders everything, entirely in your browser with nothing uploaded:
   EAPOL messages M1–M4 were caught, and whether the pair is **crackable** (has an ANonce from M1/M3
   and a MIC from M2/M4)
 
-There is a **Load demo data** button to see the whole layout — including a synthetic four-way
-handshake — without a card.
+Because the logs combine many boots, a **session chip bar** appears when more than one session is
+present: click **All** to join everything (the default), or pick individual sessions to isolate one
+boot or join any subset — every chart, card and table updates to the current selection.
+
+There is a **Load demo data** button to see the whole layout — two sessions plus a synthetic
+four-way handshake — without a card.
 
 ## Rebuilding the web flasher image
 
