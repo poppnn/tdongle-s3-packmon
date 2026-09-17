@@ -504,25 +504,33 @@ static bool sd_init() {
     ts_base = (uint64_t)log_session * 86400ULL * 1000000ULL;
     cap_bssid_n = 0;
 
+    // Whether to write the header is decided from exists() *before* opening:
+    // File::size() straight after a FILE_APPEND open proved unreliable on this
+    // hardware, which could leave a file (including the pcapng) with no header.
+    bool ev_new = !SD_MMC.exists("/packmon-logs/events.csv");
+    bool nt_new = !SD_MMC.exists("/packmon-logs/networks.csv");
+    bool st_new = !SD_MMC.exists("/packmon-logs/stats.csv");
+    bool hs_new = !SD_MMC.exists("/packmon-logs/capture.pcapng");
+
     f_events = SD_MMC.open("/packmon-logs/events.csv", FILE_APPEND);
-    if (f_events && f_events.size() == 0)
+    if (f_events && ev_new)
         f_events.print("session,time,type,channel,rssi,src,dst\n");
 
     f_nets = SD_MMC.open("/packmon-logs/networks.csv", FILE_APPEND);
-    if (f_nets && f_nets.size() == 0)
+    if (f_nets && nt_new)
         f_nets.print("session,time,bssid,ssid,channel,rssi,security\n");
 
     f_stats = SD_MMC.open("/packmon-logs/stats.csv", FILE_APPEND);
-    if (f_stats && f_stats.size() == 0) {
+    if (f_stats && st_new) {
         f_stats.print("session,time,total,mgmt,ctrl,data,beacon,deauth,rate");
         for (int c = 1; c <= MAX_CHANNELS; c++) f_stats.printf(",ch%d", c);
         f_stats.print("\n");
     }
 
-    // The pcapng section/interface headers are written once, when the file is
-    // first created; later boots append their packet blocks after them.
+    // pcapng section/interface headers: written once when the file is first
+    // created; later boots append their packet blocks after them.
     f_hs = SD_MMC.open("/packmon-logs/capture.pcapng", FILE_APPEND);
-    if (f_hs && f_hs.size() == 0) pcapng_write_header(f_hs);
+    if (f_hs && hs_new) pcapng_write_header(f_hs);
 
     log_dirty = true;
     return f_events && f_stats;

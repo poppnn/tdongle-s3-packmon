@@ -267,12 +267,12 @@ function feedPacket(buf, dv, fo, pend, linktype){
 }
 
 // pcapng: Section Header (0x0A0D0D0A) + Interface Description (1) + Enhanced
-// Packet Blocks (6). This is what the firmware writes now.
-function parsePcapng(buf){
+// Packet Blocks (6). `startO`/`le` let us also parse a headerless file that
+// begins directly at a packet block (an early firmware bug produced these).
+function parsePcapng(buf, startO, leForce){
   const dv = new DataView(buf);
-  const bom = dv.getUint32(8, true);
-  const le = (bom === 0x1a2b3c4d);          // else big-endian
-  let linktype = 127, o = 0;
+  const le = leForce !== undefined ? leForce : (dv.getUint32(8, true) === 0x1a2b3c4d);
+  let linktype = 127, o = startO || 0;
   while(o + 12 <= dv.byteLength){
     const btype = dv.getUint32(o, le);
     const blen  = dv.getUint32(o + 4, le);
@@ -315,8 +315,11 @@ function parsePcap(buf){
   hs.files++;
   const dv = new DataView(buf);
   if(dv.byteLength < 24){ hs.badpcap++; return; }
-  if(dv.getUint32(0) === 0x0a0d0d0a) parsePcapng(buf);   // pcapng section header
-  else parsePcapClassic(buf);
+  const first = dv.getUint32(0);          // big-endian read
+  if(first === 0x0a0d0d0a) parsePcapng(buf);              // pcapng with section header
+  else if(dv.getUint32(0, true) === 6 || dv.getUint32(0, true) === 1)
+    parsePcapng(buf, 0, true);            // headerless pcapng: starts at a block, assume LE
+  else parsePcapClassic(buf);             // classic libpcap
 }
 
 // ── File intake ────────────────────────────────────────────────────────────
