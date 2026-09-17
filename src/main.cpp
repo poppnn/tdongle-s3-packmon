@@ -157,6 +157,7 @@ static uint32_t last_rate = 0;
 
 static uint32_t alert_ts = 0;
 static bool     alert_on = false;
+static bool     alert_jump = false;   // land on THREATS once the alert releases
 static uint8_t  alert_ch = 0;
 static int8_t   alert_rssi = 0;
 static uint8_t  alert_src[6] = {0};
@@ -405,6 +406,7 @@ static void threat_add(const evt_t *e) {
 
     alert_ts   = millis();
     alert_on   = true;
+    alert_jump = true;
     alert_ch   = e->channel;
     alert_rssi = e->rssi;
     memcpy(alert_src, e->bssid, 6);
@@ -841,6 +843,7 @@ static void reset_stats() {
     memset(graph, 0, sizeof(graph));
     memset(aps, 0, sizeof(aps));
     ap_count = threat_count = threat_next = 0;
+    alert_on = alert_jump = false;
     last_snapshot = 0;
     rate_window_base = 0;
     last_rate = 0;
@@ -953,11 +956,22 @@ void loop() {
             toast("STATS CLEARED");
         }
     } else if (btn_down) {
-        if (now - btn_t0 < HOLD_LOCK_MS) goto_page(page + 1);
+        // Taps are swallowed while the alert owns the screen, otherwise they
+        // would shuffle a page nobody can see and fight the jump below.
+        if (now - btn_t0 < HOLD_LOCK_MS && !alert_on) goto_page(page + 1);
         btn_down = false;
     }
 
-    if (alert_on && now - alert_ts > ALERT_MS) alert_on = false;
+    // When the alert lets go of the screen, slide onto THREATS rather than
+    // back to whatever page was up: the overlay gives the headline, the page
+    // gives the history behind it.
+    if (alert_on && now - alert_ts > ALERT_MS) {
+        alert_on = false;
+        if (alert_jump) {
+            alert_jump = false;
+            if (page != PAGE_THREATS) goto_page(PAGE_THREATS);
+        }
+    }
 
     // Periodic heartbeat, so a host logging the serial port gets the picture
     // without having to read the screen.

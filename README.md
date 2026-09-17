@@ -108,7 +108,10 @@ The UI draws into a 160×80 framebuffer (25 KB) and flushes it once per frame. T
 animation possible at all: partial redraws straight to the panel flicker, a single flush does not.
 
 A deauth frame takes over the screen for 5 s regardless of which page you are on, with a shrinking
-bar showing when it will hand the page back.
+bar showing when it will hand the page back. It then slides onto **THREATS** rather than returning
+to the page you were on, so the overlay gives you the headline — how strong the attacker is, right
+now — and the page you land on gives the history behind it. Button taps are ignored while the
+overlay is up.
 
 ## Rebuilding the web flasher image
 
