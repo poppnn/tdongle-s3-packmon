@@ -149,7 +149,7 @@
     <h1 class="logo">poppn</h1>
     <div class="rule"></div>
     <p class="tag">WiFi Packet Monitor &amp; Deauth Detector</p>
-    <p class="sub">LilyGO T-Dongle S3 &nbsp;·&nbsp; ESP32-S3 &nbsp;·&nbsp; v4</p>
+    <p class="sub">LilyGO T-Dongle S3 &nbsp;·&nbsp; ESP32-S3 &nbsp;·&nbsp; v5</p>
   </header>
 
   <section class="panel flash">
@@ -190,7 +190,7 @@
       <li><b>System</b> — uptime, frame-type breakdown, free RAM and frame rate.</li>
       <li>Deauth / disassoc detection interrupts any page with a full-screen alert, then drops you on <b>Threats</b> automatically.</li>
       <li><b>SD logging</b> — insert a microSD before power-on and every session is written as readable CSV under <code>packmon-logs/</code>.</li>
-      <li><b>Handshake capture</b> — EAPOL frames are saved as <code>.pcap</code> under <code>packmon-hs/</code> when a card is present.</li>
+      <li><b>Handshake capture</b> — EAPOL frames are saved as a <code>.pcap</code> in <code>packmon-logs/</code> when a card is present.</li>
       <li>Everything renders through a framebuffer at 30&nbsp;fps — no flicker, animated throughout.</li>
       <li>APA102 status LED shifts colour with traffic load, strobes red on attack.</li>
     </ul>
@@ -207,7 +207,7 @@
       <tr><td class="k"><code>packmon-logs/sNNNN-events.csv</code></td><td class="v">every deauth / disassoc: time, channel, RSSI, MACs</td></tr>
       <tr><td class="k"><code>packmon-logs/sNNNN-networks.csv</code></td><td class="v">each network first seen: SSID, BSSID, channel, security</td></tr>
       <tr><td class="k"><code>packmon-logs/sNNNN-stats.csv</code></td><td class="v">a snapshot every 5&nbsp;s: frame counts, rate, per-channel totals</td></tr>
-      <tr><td class="k"><code>packmon-hs/sNNNN.pcap</code></td><td class="v">captured EAPOL handshakes (+ a beacon per network)</td></tr>
+      <tr><td class="k"><code>packmon-logs/sNNNN.pcap</code></td><td class="v">captured EAPOL handshakes (+ a beacon per network)</td></tr>
     </table>
     <p style="margin:14px 0 0;">
       <a href="viewer.html" style="font-weight:700;color:var(--accent);">→ Open the log viewer</a>

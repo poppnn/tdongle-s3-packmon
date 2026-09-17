@@ -389,7 +389,7 @@ function render(){
   note.innerHTML = hs.frames
     ? 'Convert a capture to a hashcat 22000 file with <code>hcxpcapngtool -o hs.22000 sNNNN.pcap</code>, '+
       'then <code>hashcat -m 22000 hs.22000 wordlist.txt</code>. Only run this against networks you own or are authorised to test.'
-    : 'Drop the <code>packmon-hs/sNNNN.pcap</code> files too and this page will decode the handshakes it caught.';
+    : 'Drop the <code>packmon-logs/sNNNN.pcap</code> files too and this page will decode the handshakes it caught.';
 }
 
 function renderHandshakes(){

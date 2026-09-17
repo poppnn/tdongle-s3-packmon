@@ -269,11 +269,12 @@ static uint16_t rssi_color(int8_t r) {
 }
 
 // ─── SD logging ────────────────────────────────────────────────────────────
-// Three plain CSV files per session under /packmon-logs, plus one .pcap of
-// captured handshakes under /packmon-hs. CSV is chosen so the raw files are
-// readable in any text editor or spreadsheet; the bundled viewer turns them
-// into charts. Files are kept open for the whole session and flushed on a
-// timer, so no line is lost to a yank but the card is not hammered per write.
+// Per session, all under /packmon-logs: three plain CSV files plus one .pcap
+// of captured handshakes, sharing the sNNNN prefix. CSV is chosen so the raw
+// files are readable in any text editor or spreadsheet; the bundled viewer
+// turns them into charts. Files are kept open for the whole session and
+// flushed on a timer, so no line is lost to a yank but the card is not
+// hammered per write.
 static int  log_session = 0;
 static File f_events, f_nets, f_stats, f_hs;
 static bool log_dirty = false;
@@ -390,7 +391,6 @@ static bool sd_init() {
     if (SD_MMC.cardType() == CARD_NONE) { SD_MMC.end(); return false; }
 
     SD_MMC.mkdir("/packmon-logs");
-    SD_MMC.mkdir("/packmon-hs");
     log_session = sd_next_session();
 
     char path[40];
@@ -410,7 +410,7 @@ static bool sd_init() {
         f_stats.print("\n");
     }
 
-    snprintf(path, sizeof(path), "/packmon-hs/s%04d.pcap", log_session);
+    snprintf(path, sizeof(path), "/packmon-logs/s%04d.pcap", log_session);
     f_hs = SD_MMC.open(path, FILE_WRITE);
     if (f_hs) pcap_write_header(f_hs);
 

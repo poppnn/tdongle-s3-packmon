@@ -126,9 +126,10 @@ Logging is **opt-in by hardware**: on boot, during the splash, packmon probes fo
 runs exactly as before and never touches the card again. The splash shows `SD OK  logging sNNNN`
 or `no SD  logging off`, and the SYSTEM page shows the state live.
 
-When a card is found, two folders are created at the card root:
+When a card is found, a single `packmon-logs/` folder is created at the card root, holding everything
+for every session — the CSV logs and the handshake `.pcap`, all sharing the `sNNNN` prefix.
 
-### `packmon-logs/` — readable CSV
+### `packmon-logs/` — one folder, everything in it
 
 One set of files per session (`sNNNN`, an incrementing counter kept in `session.txt`). Timestamps
 are `HH:MM:SS.mmm` from power-on — there is no RTC.
@@ -138,16 +139,17 @@ are `HH:MM:SS.mmm` from power-on — there is no RTC.
 | `sNNNN-events.csv` | deauth / disassoc frame | `time, type, channel, rssi, src, dst` |
 | `sNNNN-networks.csv` | network first seen | `time, bssid, ssid, channel, rssi, security` |
 | `sNNNN-stats.csv` | 5-second snapshot | `time, total, mgmt, ctrl, data, beacon, deauth, rate, ch1..ch13` |
+| `sNNNN.pcap` | captured 802.11 frame | libpcap (link type 105), handshakes + a beacon per network |
 
-Files are kept open for the session and flushed every 3 s, so a yanked card loses at most the last
+The CSVs are kept open for the session and flushed every 3 s, so a yanked card loses at most the last
 few seconds. SSIDs are sanitised (commas, quotes and control bytes stripped) so the CSV never breaks.
 
-### `packmon-hs/` — handshake captures
+### `sNNNN.pcap` — handshake captures
 
 EAPOL frames from WPA/WPA2 four-way handshakes travel in the clear as data frames, so they are
-visible in monitor mode. Each one is written to `sNNNN.pcap` (libpcap, link type 105 = IEEE 802.11),
-along with one beacon per network so the capture carries the SSID. Open it in Wireshark, or convert
-it for cracking:
+visible in monitor mode. Each one is written to the session `.pcap` (libpcap, link type 105 = IEEE
+802.11), along with one beacon per network so the capture carries the SSID. Open it in Wireshark, or
+convert it for cracking:
 
 ```bash
 hcxpcapngtool -o handshake.22000 sNNNN.pcap
