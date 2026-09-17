@@ -13,7 +13,7 @@ attacker's MAC, channel and RSSI the moment it sees a deauth or disassoc frame.
 ## Features
 
 - Promiscuous 802.11 capture on channels 1–13, hopping every 500 ms
-- Six pages cycled with the dongle's own button — nothing to configure
+- Seven pages cycled with the dongle's own button — nothing to configure
 - Deauth / disassoc detection: full-screen alert over any page, strobing LED, serial log
 - Beacon parsing builds a live table of nearby networks (SSID, channel, encryption, RSSI)
 - Per-channel activity bars so you can see which channel the noise is on
@@ -33,6 +33,7 @@ attacker's MAC, channel and RSSI the moment it sees a deauth or disassoc frame.
 | **CHANNELS** | activity bar per channel 1–13, busiest channel and its share |
 | **NETWORKS** | nearby APs sorted by signal — SSID, lock, channel, RSSI bars |
 | **THREATS** | deauth total and the last three events with MAC, channel, RSSI, age |
+| **HANDSHAKE** | per AP+client pair: which of M1–M4 were caught and whether it's usable |
 | **SYSTEM** | uptime, packet total, network count, mgmt/data split, free RAM, fps |
 | **USB** | mount the SD card as a USB drive on a PC / phone |
 
@@ -113,7 +114,7 @@ from a laptop or phone terminal (115200 baud, pick the CDC serial port). Type `h
 | Command | Effect |
 |---|---|
 | `help` / `status` | list commands / one-line summary of everything |
-| `page <name\|next\|prev\|0-5>` | switch page |
+| `page <name\|next\|prev\|0-6>` | switch page |
 | `channel <1-13>` · `lock` · `unlock` | lock to a channel / stop / resume hopping |
 | `nets` · `threats` | list networks / deauth events |
 | `reset` | clear all counters and tables |
@@ -134,10 +135,9 @@ The UI draws into a 160×80 framebuffer (25 KB) and flushes it once per frame. T
 animation possible at all: partial redraws straight to the panel flicker, a single flush does not.
 
 A deauth frame takes over the screen for 5 s regardless of which page you are on, with a shrinking
-bar showing when it will hand the page back. It then slides onto **THREATS** rather than returning
-to the page you were on, so the overlay gives you the headline — how strong the attacker is, right
-now — and the page you land on gives the history behind it. Button taps are ignored while the
-overlay is up.
+bar showing when it will hand the page back. When it releases it returns to the page you were on
+(the **THREATS** page holds the deauth history whenever you want it). Button taps are ignored while
+the overlay is up.
 
 ## SD-card logging
 

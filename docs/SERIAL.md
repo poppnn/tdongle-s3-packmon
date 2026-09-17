@@ -21,7 +21,7 @@ On boot the device prints `[poppn] serial console ready - type 'help'`. Type `he
 |---|---|
 | `help` (or `?`) | list all commands |
 | `status` | one-line summary: uptime, channel, packet/frame counts, deauth, EAPOL, networks, rate, page, SD and USB state, free heap |
-| `page <arg>` | switch page. `<arg>` = a name (`live`, `channels`, `networks`, `threats`, `system`, `usb`), `next`, `prev`, or an index `0`–`5`. With no arg, prints the current page |
+| `page <arg>` | switch page. `<arg>` = a name (`live`, `channels`, `networks`, `threats`, `handshake`, `system`, `usb`), `next`, `prev`, or an index `0`–`6`. With no arg, prints the current page |
 | `channel <1-13>` (or `ch`) | lock to a specific channel and stop hopping |
 | `lock` | stop channel hopping on the current channel |
 | `unlock` (or `hop`) | resume channel hopping |

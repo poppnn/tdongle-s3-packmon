@@ -218,8 +218,8 @@ static threat_t threats[MAX_THREATS];
 static int threat_count = 0, threat_next = 0;
 
 // ─── UI state ──────────────────────────────────────────────────────────────
-enum { PAGE_LIVE, PAGE_CHANNELS, PAGE_NETWORKS, PAGE_THREATS, PAGE_SYSTEM, PAGE_USB, PAGE_COUNT };
-static const char *PAGE_NAME[PAGE_COUNT] = { "LIVE", "CHANNELS", "NETWORKS", "THREATS", "SYSTEM", "USB" };
+enum { PAGE_LIVE, PAGE_CHANNELS, PAGE_NETWORKS, PAGE_THREATS, PAGE_HS, PAGE_SYSTEM, PAGE_USB, PAGE_COUNT };
+static const char *PAGE_NAME[PAGE_COUNT] = { "LIVE", "CHANNELS", "NETWORKS", "THREATS", "HANDSHAKE", "SYSTEM", "USB" };
 
 static int   page = PAGE_LIVE, page_from = PAGE_LIVE;
 static int   slide_dir = 1;
@@ -859,7 +859,7 @@ static void threat_add(const evt_t *e) {
 
     alert_ts   = millis();
     alert_on   = true;
-    alert_jump = true;
+    alert_jump = false;   // full-screen alert only; no auto-switch to THREATS
     alert_ch   = e->channel;
     alert_rssi = e->rssi;
     memcpy(alert_src, e->bssid, 6);
@@ -1147,6 +1147,55 @@ static void page_threats(int ox) {
     }
 }
 
+// ─── Page: HANDSHAKE ───────────────────────────────────────────────────────
+static void page_hs(int ox) {
+    draw_header(ox, PAGE_NAME[PAGE_HS]);
+
+    // Summary line: EAPOL count and overall usable status.
+    txt(ox + 4, 14, C_LABEL, 1, "EAPOL");
+    txt(ox + 44, 14, C_TEXT, 1, "%u", s_eapol);
+    if (hs_ok > 0)          txt_r(ox + SCR_W - 4, 14, C_OK,   1, "USABLE %u/%u", hs_ok, hs_pairs);
+    else if (hs_pairs > 0)  txt_r(ox + SCR_W - 4, 14, C_WARN, 1, "PARTIAL %u", hs_pairs);
+    else                    txt_r(ox + SCR_W - 4, 14, C_SEP,  1, "waiting");
+    gfx->drawFastHLine(ox + 4, 23, SCR_W - 8, C_SEP);
+
+    if (hsst_n == 0) {
+        txt_c(ox + SCR_W / 2, 38, C_SEP, 1, "no EAPOL captured yet");
+        txt_c(ox + SCR_W / 2, 50, C_LABEL, 1, "lock a channel and wait");
+        txt_c(ox + SCR_W / 2, 60, C_SEP, 1, "for a client to connect");
+        return;
+    }
+
+    // Column legend: the four M-boxes = messages M1..M4.
+    txt(ox + 2, 25, C_LABEL, 1, "NET");
+    for (int m = 0; m < 4; m++) txt(ox + 73 + m * 9, 25, C_LABEL, 1, "%d", m + 1);
+    txt_r(ox + SCR_W - 2, 25, C_LABEL, 1, "USE");
+
+    // One row per AP+client pair (newest tracked first up to 4).
+    const int y0 = 35, rh = 10;
+    int n = hsst_n < 4 ? hsst_n : 4;
+    for (int i = 0; i < n; i++) {
+        hsst_t *p = &hsst[i];
+        int y = y0 + i * rh;
+
+        const char *name = nullptr;
+        for (int a = 0; a < ap_count; a++)
+            if (!memcmp(aps[a].bssid, p->ap, 6) && aps[a].ssid[0]) { name = aps[a].ssid; break; }
+        char nm[12];
+        if (name) { strncpy(nm, name, 11); nm[11] = '\0'; }
+        else snprintf(nm, sizeof(nm), "%02X%02X%02X", p->ap[3], p->ap[4], p->ap[5]);
+        txt(ox + 2, y, C_TEXT, 1, nm);
+
+        for (int m = 0; m < 4; m++) {
+            bool on = p->msgs & (1 << m);
+            gfx->fillRect(ox + 72 + m * 9, y - 1, 7, 8, on ? C_ACCENT : C_ROW);
+            gfx->drawRect(ox + 72 + m * 9, y - 1, 7, 8, C_SEP);
+        }
+        bool ok = (p->msgs & 0x5) && (p->msgs & 0xA);
+        txt_r(ox + SCR_W - 2, y, ok ? C_OK : C_WARN, 1, ok ? "OK" : "--");
+    }
+}
+
 // ─── Page: SYSTEM ──────────────────────────────────────────────────────────
 static void page_system(int ox) {
     draw_header(ox, PAGE_NAME[PAGE_SYSTEM]);
@@ -1267,6 +1316,7 @@ static void draw_page(int p, int ox) {
         case PAGE_CHANNELS: page_channels(ox); break;
         case PAGE_NETWORKS: page_networks(ox); break;
         case PAGE_THREATS:  page_threats(ox);  break;
+        case PAGE_HS:       page_hs(ox);       break;
         case PAGE_SYSTEM:   page_system(ox);   break;
         case PAGE_USB:      page_usb(ox);      break;
     }
@@ -1452,7 +1502,7 @@ static void serial_help() {
         "commands:\n"
         "  help                 this list\n"
         "  status               one-line summary of everything\n"
-        "  page <name|next|prev|0-5>   switch page (live/channels/networks/threats/system/usb)\n"
+        "  page <name|next|prev|0-6>   switch page (live/channels/networks/threats/handshake/system/usb)\n"
         "  channel <1-13>       lock to a channel\n"
         "  lock | unlock | hop  stop / resume channel hopping\n"
         "  nets                 list discovered networks\n"
