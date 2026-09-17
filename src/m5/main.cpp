@@ -98,17 +98,28 @@ typedef struct { uint8_t src[6],dst[6]; uint8_t channel; int8_t rssi; uint32_t t
 static threat_t threats[MAX_THREATS]; static int threat_count=0, threat_next=0;
 
 // ─── UI / state ──────────────────────────────────────────────────────────────
-enum { PAGE_LIVE, PAGE_NETWORKS, PAGE_THREATS, PAGE_HS, PAGE_WEBUI, PAGE_COUNT };
-static const char* PAGE_NAME[PAGE_COUNT]={"LIVE","NETWORKS","THREATS","HANDSHAKE","WEB UI"};
+enum { PAGE_LIVE, PAGE_CHANNELS, PAGE_NETWORKS, PAGE_THREATS, PAGE_HS, PAGE_SYSTEM, PAGE_WEBUI, PAGE_COUNT };
+static const char* PAGE_NAME[PAGE_COUNT]={"LIVE","CHANNELS","NETWORKS","THREATS","HANDSHAKE","SYSTEM","WEB UI"};
 static int page=PAGE_LIVE;
 static uint16_t graph[GRAPH_W]={0}; static int graph_idx=0; static uint32_t last_snapshot=0;
 static int current_channel=1; static bool ch_lock=false;
-static float f_rate=0, f_scale=1;
+static float f_rate=0, f_rssi=0, f_scale=1;
+static float ch_bar[MAX_CHANNELS+1]={0}, ch_recent[MAX_CHANNELS+1]={0};
 static uint32_t rate_window_ts=0, rate_window_base=0, last_rate=0;
 static uint32_t alert_ts=0; static bool alert_on=false; static uint8_t alert_ch=0;
 static int8_t alert_rssi=0; static uint8_t alert_src[6]={0};
-static uint32_t boot_ms=0;
+static uint32_t boot_ms=0, fps=0, fps_frames=0, fps_ts=0;
 static int log_session=0;
+
+// Deauth burst filter: a lone deauth (often a corrupt frame at weak signal)
+// must not raise the full-screen alert. Only a burst does.
+#define DEAUTH_BURST_N   3      // frames...
+#define DEAUTH_BURST_MS  1200   // ...within this window
+static uint32_t deauth_win_ts=0; static uint8_t deauth_win_n=0;
+
+// Toast (transient on-screen message)
+static char toast_msg[24]={0}; static uint32_t toast_ts=0;
+static void toast(const char*m){ strncpy(toast_msg,m,sizeof(toast_msg)-1); toast_msg[sizeof(toast_msg)-1]=0; toast_ts=millis(); }
 
 // ─── WebUI ───────────────────────────────────────────────────────────────────
 static WebServer server(80);
@@ -240,7 +251,16 @@ static void threat_add(const evt_t*e){
     threat_t*t=&threats[threat_next]; memcpy(t->src,e->bssid,6); memcpy(t->dst,e->dst,6);
     t->channel=e->channel; t->rssi=e->rssi; t->ts=millis();
     threat_next=(threat_next+1)%MAX_THREATS; if(threat_count<MAX_THREATS)threat_count++;
-    alert_ts=millis(); alert_on=true; alert_ch=e->channel; alert_rssi=e->rssi; memcpy(alert_src,e->bssid,6);
+
+    // Burst filter: raise the full-screen alert only when several deauth frames
+    // arrive close together (a real attack), not on an isolated frame — which
+    // at weak signal is usually a CRC-corrupt frame misread as a deauth.
+    uint32_t now=millis();
+    if(now-deauth_win_ts>DEAUTH_BURST_MS){ deauth_win_ts=now; deauth_win_n=0; }
+    deauth_win_n++;
+    if(deauth_win_n>=DEAUTH_BURST_N){
+        alert_ts=now; alert_on=true; alert_ch=e->channel; alert_rssi=e->rssi; memcpy(alert_src,e->bssid,6);
+    }
     if(fs_ok&&f_events){ char ts[16]; uint32_t ms=millis();
         snprintf(ts,sizeof(ts),"%02u:%02u:%02u.%03u",ms/3600000,(ms/60000)%60,(ms/1000)%60,ms%1000);
         f_events.printf("%d,%s,%s,%u,%d,%s,%s\n",log_session,ts,e->sub==SUB_DEAUTH?"deauth":"disassoc",
@@ -384,116 +404,179 @@ static void webui_start(){
 }
 static void webui_stop(){ server.stop(); WiFi.softAPdisconnect(true); webui_on=false; sniffer_start(); }
 
-// ─── Pages ───────────────────────────────────────────────────────────────────
+// ─── Pages (same layout language as the T-Dongle, scaled to 240x135) ─────────
+static float hold_frac=0;   // fill of the button hold-progress bar (0..1)
+
+static void draw_lock(int x,int y,uint16_t c){
+    cv.drawFastHLine(x+1,y,3,c); cv.drawPixel(x,y+1,c); cv.drawPixel(x+4,y+1,c);
+    cv.fillRect(x,y+2,5,5,c);
+}
+static void draw_rssi_bars(int x,int y,int8_t r){
+    int lvl = r>=-52?4:(r>=-64?3:(r>=-74?2:(r>=-85?1:0)));
+    uint16_t on=rssi_color(r);
+    for(int i=0;i<4;i++){int h=3+i*3; cv.fillRect(x+i*4,y+11-h,3,h,i<lvl?on:C_SEP);}
+}
 static void header(const char*t){
-    cv.fillRect(0,0,SCR_W,14,C_PANEL); cv.drawFastHLine(0,14,SCR_W,C_SEP);
-    txt(4,3,C_ACCENT,1,t); cv.drawFastHLine(4,12,(int)strlen(t)*6,C_ACCENT);
-    txt_r(SCR_W-4,3,rssi_color(s_rssi),1,"%d",(int)s_rssi);
-    txt_r(SCR_W-40,3,ch_lock?C_WARN:C_LABEL,1,"CH%02d",current_channel);
+    cv.fillRect(0,0,SCR_W,15,C_PANEL); cv.drawFastHLine(0,15,SCR_W,C_SEP);
+    txt(4,4,C_ACCENT,1,t); cv.drawFastHLine(4,13,(int)strlen(t)*6,C_ACCENT);
+    txt_r(SCR_W-4,4,rssi_color((int8_t)f_rssi),1,"%d",(int)f_rssi);
+    txt_r(SCR_W-34,4,ch_lock?C_WARN:C_LABEL,1,"CH%02d",current_channel);
+    if(ch_lock) draw_lock(SCR_W-70,4,C_WARN);
 }
 static void page_live(){
     header("LIVE");
     uint16_t rc=f_rate>400?C_DANGER:(f_rate>120?C_WARN:C_ACCENT);
-    txt(6,20,rc,4,"%d",(int)(f_rate+.5f)); txt(6,54,C_LABEL,1,"PKT/S");
+    txt(6,22,rc,5,"%d",(int)(f_rate+.5f)); txt(6,64,C_LABEL,1,"PKT/S");
     char b[16]; fmt_num(b,sizeof(b),s_total);
-    txt_r(SCR_W-6,20,C_LABEL,1,"TOTAL"); txt_r(SCR_W-6,30,C_TEXT,2,b);
-    txt_r(SCR_W-6,52,s_deauth?C_DANGER:C_LABEL,1,"DEAUTH %u",s_deauth);
-    // EAPOL / usable
-    if(s_eapol==0) txt(6,68,C_SEP,1,"HS  no EAPOL yet");
-    else { txt(6,68,C_LABEL,1,"EAPOL"); txt(52,68,C_TEXT,1,"%u",s_eapol);
-        if(hs_ok>0)txt(96,68,C_OK,1,"USABLE %u/%u",hs_ok,hs_pairs); else txt(96,68,C_WARN,1,"PARTIAL %u",hs_pairs); }
-    // rate graph
-    const int gx=6,gy=82,gh=44,gw=GRAPH_W;
+    txt_r(SCR_W-6,22,C_LABEL,1,"TOTAL"); txt_r(SCR_W-6,34,C_TEXT,2,b);
+    txt_r(SCR_W-6,58,s_deauth?C_DANGER:C_LABEL,1,"DEAUTH %u",s_deauth);
+    if(s_eapol==0) txt(6,78,C_SEP,1,"HS  no EAPOL yet");
+    else { txt(6,78,C_LABEL,1,"EAPOL"); txt(52,78,C_TEXT,1,"%u",s_eapol);
+        if(hs_ok>0)txt(100,78,C_OK,1,"USABLE %u/%u",hs_ok,hs_pairs); else txt(100,78,C_WARN,1,"PARTIAL %u",hs_pairs); }
+    const int gx=6,gy=92,gh=34,gw=GRAPH_W;
     cv.fillRect(gx,gy,gw,gh,C_ROW);
     uint16_t pk=1; for(int i=0;i<gw;i++)if(graph[i]>pk)pk=graph[i];
     f_scale=ease(f_scale,(float)pk,0.08f); float sc=f_scale<1?1:f_scale;
     for(int i=0;i<gw;i++){int idx=(graph_idx+1+i)%gw; int h=(int)((float)graph[idx]/sc*(gh-1)+.5f);
         if(h<=0)continue; if(h>gh)h=gh; cv.drawFastVLine(gx+i,gy+gh-h,h,grad_green_at(i,gw)); cv.drawPixel(gx+i,gy+gh-h,C_ACCENT);}
     cv.drawFastHLine(gx,gy+gh,gw,C_SEP);
-    txt_c(SCR_W/2,gy+gh+3,C_SEP,1,"BtnA:page  BtnB:Web UI");
+}
+static void page_channels(){
+    header("CHANNELS");
+    float mx=1; int busy=1;
+    for(int c=1;c<=MAX_CHANNELS;c++) if(ch_recent[c]>mx){mx=ch_recent[c];busy=c;}
+    uint32_t tot=0; for(int c=1;c<=MAX_CHANNELS;c++)tot+=s_ch[c];
+    int pct=tot?(int)((uint64_t)s_ch[busy]*100/tot):0;
+    txt(6,20,C_LABEL,1,"BUSIEST"); txt(70,20,C_ACCENT,1,"CH%02d",busy);
+    txt_r(SCR_W-6,20,C_TEXT,1,"%d%%",pct);
+    const int base=118, top=34, maxh=base-top, slot=16, bw=11;
+    const int x0=(SCR_W-(MAX_CHANNELS*slot-(slot-bw)))/2;
+    for(int c=1;c<=MAX_CHANNELS;c++){ int x=x0+(c-1)*slot;
+        int h=(int)(ch_bar[c]/mx*maxh+.5f); if(h<1)h=1; if(h>maxh)h=maxh;
+        cv.fillRect(x,top,bw,maxh,C_ROW);
+        for(int r=0;r<h;r++)cv.drawFastHLine(x,base-1-r,bw,grad_green_at(r,maxh));
+        if(c==current_channel){cv.drawRect(x-1,top-1,bw+2,maxh+2,C_ACCENT); cv.fillRect(x,base,bw,1,C_ACCENT);}
+        if(c==1||c==4||c==7||c==10||c==13) txt_c(x+bw/2,base+3,c==current_channel?C_ACCENT:C_LABEL,1,"%d",c);
+    }
+    cv.drawFastHLine(x0,base,MAX_CHANNELS*slot-(slot-bw),C_SEP);
 }
 static void page_networks(){
     int idx[MAX_APS]; int n=ap_sorted(idx); header("NETWORKS");
-    txt(56,3,C_DIM,1,"%d",n);
-    if(n==0){int d=(millis()/400)%4; txt_c(SCR_W/2,60,C_LABEL,1,"SCANNING%.*s",d,"..."); return;}
-    int rows=9, y0=18, rh=13;
+    txt(62,4,C_DIM,1,"%d",n);
+    if(n==0){int d=(millis()/400)%4; txt_c(SCR_W/2,64,C_LABEL,1,"SCANNING%.*s",d,"..."); return;}
+    int rows=8, y0=20, rh=14;
     for(int r=0;r<rows&&r<n;r++){ ap_t*a=&aps[idx[r]]; int y=y0+r*rh;
-        if(r&1)cv.fillRect(0,y-1,SCR_W,rh,C_ROW);
-        char nm[18]; strncpy(nm,a->ssid[0]?a->ssid:"<hidden>",17); nm[17]=0;
+        if(r&1)cv.fillRect(0,y-2,SCR_W,rh,C_ROW);
+        char nm[20]; strncpy(nm,a->ssid[0]?a->ssid:"<hidden>",19); nm[19]=0;
         txt(4,y,a->ssid[0]?C_TEXT:C_SEP,1,nm);
+        if(a->enc)draw_lock(140,y,C_LABEL);
         txt(150,y,C_BLUE,1,"%02d",a->channel);
-        txt(170,y,a->enc?C_WARN:C_OK,1,a->enc?"enc":"opn");
+        draw_rssi_bars(172,y-1,a->rssi);
         txt_r(SCR_W-4,y,rssi_color(a->rssi),1,"%d",a->rssi); }
 }
 static void page_threats(){
     header("THREATS");
-    if(threat_count==0){ txt_c(SCR_W/2,50,C_OK,3,"CLEAR");
-        txt_c(SCR_W/2,80,C_LABEL,1,"no deauth frames seen"); return; }
-    txt(6,20,C_DANGER,3,"%u",s_deauth); txt(6,48,C_LABEL,1,"DEAUTH FRAMES");
+    if(threat_count==0){ float p=0.5f+0.5f*sinf(millis()*0.0022f);
+        txt_c(SCR_W/2,44,lerp565(C_ACCENT_D,C_OK,p),4,"CLEAR");
+        txt_c(SCR_W/2,90,C_LABEL,1,"no deauth frames seen"); return; }
+    txt(6,22,C_DANGER,4,"%u",s_deauth); txt(6,58,C_LABEL,1,"DEAUTH FRAMES");
+    txt_r(SCR_W-6,22,C_LABEL,1,"LAST %d",threat_count);
     uint32_t now=millis(); int shown=0;
-    for(int k=1;k<=MAX_THREATS&&shown<5;k++){ if(k>threat_count)break;
-        int i=(threat_next-k+MAX_THREATS)%MAX_THREATS; threat_t*t=&threats[i]; int y=64+shown*13;
-        if(shown&1)cv.fillRect(0,y-1,SCR_W,13,C_ROW);
-        txt(4,y,rssi_color(t->rssi),1,"%d",t->rssi); txt(40,y,C_BLUE,1,"CH%02d",t->channel);
-        txt(80,y,C_TEXT,1,"%02X:%02X:%02X",t->src[3],t->src[4],t->src[5]);
+    for(int k=1;k<=MAX_THREATS&&shown<4;k++){ if(k>threat_count)break;
+        int i=(threat_next-k+MAX_THREATS)%MAX_THREATS; threat_t*t=&threats[i]; int y=74+shown*14;
+        if(shown&1)cv.fillRect(0,y-2,SCR_W,14,C_ROW);
+        txt(4,y,rssi_color(t->rssi),1,"%d",t->rssi); txt(44,y,C_BLUE,1,"CH%02d",t->channel);
+        txt(90,y,C_TEXT,1,"%02X:%02X:%02X",t->src[3],t->src[4],t->src[5]);
         char age[12]; fmt_up(age,sizeof(age),now-t->ts); txt_r(SCR_W-4,y,C_LABEL,1,age); shown++; }
 }
 static void page_hs(){
     header("HANDSHAKE");
-    txt(6,20,C_LABEL,1,"EAPOL"); txt(52,20,C_TEXT,1,"%u",s_eapol);
-    if(hs_ok>0)txt_r(SCR_W-6,20,C_OK,1,"USABLE %u/%u",hs_ok,hs_pairs);
-    else if(hs_pairs>0)txt_r(SCR_W-6,20,C_WARN,1,"PARTIAL %u",hs_pairs);
-    else txt_r(SCR_W-6,20,C_SEP,1,"waiting");
-    cv.drawFastHLine(6,31,SCR_W-12,C_SEP);
-    if(hsst_n==0){ txt_c(SCR_W/2,60,C_SEP,1,"no EAPOL captured yet");
-        txt_c(SCR_W/2,74,C_LABEL,1,"lock a channel and wait"); return; }
-    txt(4,34,C_LABEL,1,"NET"); for(int m=0;m<4;m++)txt(120+m*14,34,C_LABEL,1,"%d",m+1);
-    txt_r(SCR_W-4,34,C_LABEL,1,"USE");
-    int y0=46, rh=13, n=hsst_n<6?hsst_n:6;
+    txt(6,22,C_LABEL,1,"EAPOL"); txt(52,22,C_TEXT,1,"%u",s_eapol);
+    if(hs_ok>0)txt_r(SCR_W-6,22,C_OK,1,"USABLE %u/%u",hs_ok,hs_pairs);
+    else if(hs_pairs>0)txt_r(SCR_W-6,22,C_WARN,1,"PARTIAL %u",hs_pairs);
+    else txt_r(SCR_W-6,22,C_SEP,1,"waiting");
+    cv.drawFastHLine(6,34,SCR_W-12,C_SEP);
+    if(hsst_n==0){ txt_c(SCR_W/2,64,C_SEP,1,"no EAPOL captured yet");
+        txt_c(SCR_W/2,80,C_LABEL,1,"lock a channel and wait"); return; }
+    txt(4,38,C_LABEL,1,"NET"); for(int m=0;m<4;m++)txt(150+m*16,38,C_LABEL,1,"%d",m+1);
+    txt_r(SCR_W-4,38,C_LABEL,1,"USE");
+    int y0=52, rh=14, n=hsst_n<6?hsst_n:6;
     for(int i=0;i<n;i++){ hsst_t*p=&hsst[i]; int y=y0+i*rh;
         const char*name=nullptr; for(int a=0;a<ap_count;a++)if(!memcmp(aps[a].bssid,p->ap,6)&&aps[a].ssid[0]){name=aps[a].ssid;break;}
-        char nm[16]; if(name){strncpy(nm,name,15);nm[15]=0;} else snprintf(nm,sizeof(nm),"%02X%02X%02X",p->ap[3],p->ap[4],p->ap[5]);
+        char nm[20]; if(name){strncpy(nm,name,19);nm[19]=0;} else snprintf(nm,sizeof(nm),"%02X%02X%02X",p->ap[3],p->ap[4],p->ap[5]);
         txt(4,y,C_TEXT,1,nm);
-        for(int m=0;m<4;m++){bool on=p->msgs&(1<<m); cv.fillRect(120+m*14,y-1,11,9,on?C_ACCENT:C_ROW); cv.drawRect(120+m*14,y-1,11,9,C_SEP);}
+        for(int m=0;m<4;m++){bool on=p->msgs&(1<<m); cv.fillRect(150+m*16,y-1,12,10,on?C_ACCENT:C_ROW); cv.drawRect(150+m*16,y-1,12,10,C_SEP);}
         bool ok=(p->msgs&0x5)&&(p->msgs&0xA); txt_r(SCR_W-4,y,ok?C_OK:C_WARN,1,ok?"OK":"--"); }
+}
+static void page_system(){
+    header("SYSTEM"); char v[24]; const int y0=22,rh=13; int r=0;
+    fmt_up(v,sizeof(v),millis()-boot_ms);
+    txt(6,y0+r*rh,C_LABEL,1,"UPTIME"); txt_r(SCR_W-6,y0+r*rh,C_TEXT,1,v); r++;
+    fmt_num(v,sizeof(v),s_total);
+    txt(6,y0+r*rh,C_LABEL,1,"PACKETS"); txt_r(SCR_W-6,y0+r*rh,C_TEXT,1,v); r++;
+    txt(6,y0+r*rh,C_LABEL,1,"NETWORKS"); txt_r(SCR_W-6,y0+r*rh,C_TEXT,1,"%d",ap_active()); r++;
+    char m[12],d[12]; fmt_num(m,sizeof(m),s_mgmt); fmt_num(d,sizeof(d),s_data);
+    txt(6,y0+r*rh,C_LABEL,1,"MGMT/DATA"); txt_r(SCR_W-6,y0+r*rh,C_TEXT,1,"%s/%s",m,d); r++;
+    txt(6,y0+r*rh,C_LABEL,1,"EAPOL/HS"); txt_r(SCR_W-6,y0+r*rh,s_eapol?C_ACCENT:C_TEXT,1,"%u/%u",s_eapol,hs_ok); r++;
+    txt(6,y0+r*rh,C_LABEL,1,"STORAGE");
+    if(fs_ok){ uint32_t used=LittleFS.usedBytes()/1024, tot=LittleFS.totalBytes()/1024;
+        txt_r(SCR_W-6,y0+r*rh,cap_full?C_WARN:C_ACCENT,1,"s%d %uK/%uK",log_session,used,tot);}
+    else txt_r(SCR_W-6,y0+r*rh,C_SEP,1,"off"); r++;
+    txt(6,y0+r*rh,C_LABEL,1,"RAM/FPS");
+    txt_r(SCR_W-6,y0+r*rh,fps>=20?C_OK:C_WARN,1,"%uK %uf",ESP.getFreeHeap()/1024,fps);
 }
 static void page_webui(){
     header("WEB UI");
     if(webui_on){
-        txt_c(SCR_W/2,22,C_ACCENT,2,"WEB UI ON");
-        txt(10,46,C_LABEL,1,"1. Join WiFi network:");
-        txt_c(SCR_W/2,58,C_TEXT,2,ap_ssid);
-        txt(10,78,C_LABEL,1,"2. Password:"); txt_r(SCR_W-10,78,C_TEXT,1,AP_PASS);
-        txt(10,90,C_LABEL,1,"3. Open in browser:"); txt_r(SCR_W-10,90,C_ACCENT,1,"192.168.4.1");
-        txt_c(SCR_W/2,116,C_WARN,1,"sniffing paused - BtnB to resume");
+        txt_c(SCR_W/2,24,C_ACCENT,3,"ON AIR");
+        txt(12,54,C_LABEL,1,"1 Join WiFi"); txt_r(SCR_W-12,54,C_TEXT,1,ap_ssid);
+        txt(12,68,C_LABEL,1,"2 Password"); txt_r(SCR_W-12,68,C_TEXT,1,AP_PASS);
+        txt(12,82,C_LABEL,1,"3 Browse"); txt_r(SCR_W-12,82,C_ACCENT,1,"192.168.4.1");
+        txt_c(SCR_W/2,112,C_WARN,1,"sniffing paused - BtnB to resume");
     } else {
-        txt_c(SCR_W/2,40,C_LABEL,1,"Share the logs over WiFi.");
-        txt_c(SCR_W/2,60,C_TEXT,1,"Press BtnB to start a hotspot");
-        txt_c(SCR_W/2,72,C_TEXT,1,"and browse the data.");
-        char b[24]; fmt_num(b,sizeof(b),(uint32_t)(f_hs?f_hs.size():0));
-        txt_c(SCR_W/2,100,C_SEP,1,"capture.pcapng: %s B%s",b,cap_full?" (full)":"");
+        txt_c(SCR_W/2,40,C_TEXT,1,"Read the logs over WiFi.");
+        txt_c(SCR_W/2,58,C_ACCENT,1,"Press BtnB to start a hotspot.");
+        char b[24]; fmt_num(b,sizeof(b),(uint32_t)(fs_ok?LittleFS.usedBytes():0));
+        txt_c(SCR_W/2,86,C_LABEL,1,"stored: %s B%s",b,cap_full?" (capture full)":"");
     }
+}
+static void draw_toast(){
+    uint32_t age=millis()-toast_ts; if(!toast_msg[0]||age>1600)return;
+    float t=age<160?age/160.0f:(age>1440?1.0f-(age-1440)/160.0f:1.0f); t=clampf(t,0,1);
+    int w=(int)strlen(toast_msg)*6+16, x=(SCR_W-w)/2, y=SCR_H-24;
+    cv.fillRoundRect(x,y,w,15,3,C_PANEL); cv.drawRoundRect(x,y,w,15,3,lerp565(C_PANEL,C_ACCENT,t));
+    txt_c(SCR_W/2,y+4,lerp565(C_PANEL,C_TEXT,t),1,toast_msg);
 }
 static void render_alert(){
     uint32_t age=millis()-alert_ts; float pulse=0.5f+0.5f*sinf(age*0.012f);
     cv.fillScreen(C_ALERT_BG); uint16_t bc=lerp565(C_DANGER,C_WARN,pulse);
     cv.drawRect(0,0,SCR_W,SCR_H,bc); cv.drawRect(1,1,SCR_W-2,SCR_H-2,bc);
-    txt_c(SCR_W/2,12,lerp565(C_WARN,C_TEXT,pulse),2,"!! DEAUTH !!");
+    txt_c(SCR_W/2,12,lerp565(C_WARN,C_TEXT,pulse),2,"!! DEAUTH ATTACK !!");
     char b[8]; snprintf(b,sizeof(b),"%d",(int)alert_rssi);
-    txt_c(SCR_W/2,40,C_TEXT,4,b); txt_c(SCR_W/2,80,C_WARN,1,"dBm");
-    txt(10,100,C_LABEL,1,"CH"); txt(30,100,C_TEXT,1,"%02d",alert_ch);
-    txt_r(SCR_W-10,100,C_WARN,1,"%02X:%02X:%02X:%02X:%02X:%02X",
+    txt_c(SCR_W/2,38,C_TEXT,5,b); txt_c(SCR_W/2,86,C_WARN,1,"dBm");
+    txt(12,104,C_LABEL,1,"CH"); txt(34,104,C_TEXT,1,"%02d",alert_ch);
+    txt_r(SCR_W-12,104,C_WARN,1,"%02X:%02X:%02X:%02X:%02X:%02X",
         alert_src[0],alert_src[1],alert_src[2],alert_src[3],alert_src[4],alert_src[5]);
     float left=1.0f-clampf((float)age/ALERT_MS,0,1); cv.fillRect(2,SCR_H-4,(int)((SCR_W-4)*left),2,bc);
 }
 static void render(){
     if(alert_on){render_alert();cv.pushSprite(0,0);return;}
     cv.fillScreen(C_BG);
-    switch(page){case PAGE_LIVE:page_live();break;case PAGE_NETWORKS:page_networks();break;
-        case PAGE_THREATS:page_threats();break;case PAGE_HS:page_hs();break;case PAGE_WEBUI:page_webui();break;}
-    // page dots
-    for(int i=0;i<PAGE_COUNT;i++)cv.fillRect(SCR_W/2-PAGE_COUNT*6/2+i*6,SCR_H-3,4,2,i==page?C_ACCENT:C_SEP);
+    switch(page){case PAGE_LIVE:page_live();break;case PAGE_CHANNELS:page_channels();break;
+        case PAGE_NETWORKS:page_networks();break;case PAGE_THREATS:page_threats();break;
+        case PAGE_HS:page_hs();break;case PAGE_SYSTEM:page_system();break;case PAGE_WEBUI:page_webui();break;}
+    for(int i=0;i<PAGE_COUNT;i++)cv.fillRect(SCR_W/2-PAGE_COUNT*7/2+i*7,SCR_H-3,5,2,i==page?C_ACCENT:C_SEP);
+    if(hold_frac>0.02f)cv.fillRect(0,SCR_H-2,(int)(SCR_W*clampf(hold_frac,0,1)),2,C_ACCENT_D);
+    draw_toast();
     cv.pushSprite(0,0);
+}
+
+static void reset_stats(){
+    s_total=s_mgmt=s_ctrl=s_data=s_beacon=s_deauth=s_eapol=0;
+    for(int c=0;c<=MAX_CHANNELS;c++){s_ch[c]=0;ch_recent[c]=0;ch_bar[c]=0;}
+    memset(graph,0,sizeof(graph)); memset(aps,0,sizeof(aps));
+    ap_count=threat_count=threat_next=0; hsst_n=0; hs_pairs=hs_ok=0; cap_bssid_n=0;
+    alert_on=false; deauth_win_n=0; last_snapshot=0; rate_window_base=0; last_rate=0;
 }
 
 // ─── Setup / loop ────────────────────────────────────────────────────────────
@@ -512,7 +595,11 @@ void setup(){
     delay(400);
 }
 
-static uint32_t last_hop=0,last_sample=0,last_frame=0,last_flush=0,last_statlog=0;
+static uint32_t last_hop=0,last_sample=0,last_frame=0,last_flush=0,last_statlog=0,last_decay=0;
+// Manual button timing (tap vs hold) so we can draw a hold-progress bar.
+#define A_HOLD_MS 450
+#define B_HOLD_MS 700
+static uint32_t aDown=0,bDown=0; static bool aFired=false,bFired=false;
 
 void loop(){
     M5.update();
@@ -526,21 +613,36 @@ void loop(){
         if(now-last_sample>=SAMPLE_MS){ last_sample=now; uint32_t d=s_total-last_snapshot; last_snapshot=s_total;
             graph[graph_idx]=d>65535?65535:(uint16_t)d; graph_idx=(graph_idx+1)%GRAPH_W; }
         if(now-rate_window_ts>=1000){ last_rate=s_total-rate_window_base; rate_window_base=s_total; rate_window_ts=now; }
+        if(now-last_decay>=500){ last_decay=now; static uint32_t prev[MAX_CHANNELS+1]={0};
+            for(int c=1;c<=MAX_CHANNELS;c++){uint32_t cur=s_ch[c]; ch_recent[c]=ch_recent[c]*0.75f+(float)(cur-prev[c]); prev[c]=cur;} }
         if(fs_ok){ hs_drain();
             if(now-last_statlog>=5000){last_statlog=now;log_stats(last_rate);}
             if(now-last_flush>=3000){last_flush=now;log_flush();} }
         if(alert_on&&now-alert_ts>ALERT_MS)alert_on=false;
     }
 
-    // Buttons: A = next page, A(long) = channel lock, B = toggle Web UI
-    if(M5.BtnA.wasClicked() && !webui_on) page=(page+1)%PAGE_COUNT;
-    if(M5.BtnA.wasHold() && !webui_on) ch_lock=!ch_lock;
-    if(M5.BtnB.wasClicked()){
-        if(webui_on){ webui_stop(); page=PAGE_WEBUI; }
-        else { if(fs_ok){ webui_start(); page=PAGE_WEBUI; } }
-    }
+    // Buttons — BtnA: tap=next page, hold=lock channel.
+    //           BtnB: tap=toggle Web UI, hold=clear stats.
+    hold_frac=0;
+    if(M5.BtnA.wasPressed()){aDown=now;aFired=false;}
+    if(M5.BtnA.isPressed()){ uint32_t h=now-aDown;
+        if(!webui_on) hold_frac=(float)h/A_HOLD_MS;
+        if(!aFired && h>=A_HOLD_MS && !webui_on){aFired=true; ch_lock=!ch_lock; toast(ch_lock?"CHANNEL LOCKED":"HOPPING RESUMED");} }
+    if(M5.BtnA.wasReleased() && !aFired && now-aDown<A_HOLD_MS && !webui_on) page=(page+1)%PAGE_COUNT;
+
+    if(M5.BtnB.wasPressed()){bDown=now;bFired=false;}
+    if(M5.BtnB.isPressed()){ uint32_t h=now-bDown;
+        if(!webui_on) hold_frac=(float)h/B_HOLD_MS;
+        if(!bFired && h>=B_HOLD_MS && !webui_on){bFired=true; reset_stats(); toast("STATS CLEARED");} }
+    if(M5.BtnB.wasReleased() && !bFired && now-bDown<B_HOLD_MS){
+        if(webui_on){ webui_stop(); toast("WEB UI OFF"); page=PAGE_WEBUI; }
+        else if(fs_ok){ webui_start(); page=PAGE_WEBUI; }
+        else toast("NO STORAGE"); }
 
     f_rate=ease(f_rate,(float)last_rate,0.12f);
+    f_rssi=ease(f_rssi,(float)s_rssi,0.15f);
+    for(int c=1;c<=MAX_CHANNELS;c++)ch_bar[c]=ease(ch_bar[c],ch_recent[c],0.15f);
 
-    if(now-last_frame>=FRAME_MS){ last_frame=now; render(); }
+    if(now-last_frame>=FRAME_MS){ last_frame=now; render();
+        fps_frames++; if(now-fps_ts>=1000){fps=fps_frames;fps_frames=0;fps_ts=now;} }
 }
