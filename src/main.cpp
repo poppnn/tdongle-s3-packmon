@@ -1271,6 +1271,142 @@ static void goto_page(int p) {
     slide = 1.0f;
 }
 
+// ─── Serial console ────────────────────────────────────────────────────────
+// A line-based command interface over the USB serial port. Mirrors everything
+// the button can do, plus queries. Type `help` for the list. Full reference
+// lives in docs/SERIAL.md.
+static void serial_set_channel(int c) {
+    if (c < 1 || c > MAX_CHANNELS) { Serial.println("err: channel 1-13"); return; }
+    ch_lock = true;
+    current_channel = c;
+    esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("ok: locked to channel %d\n", c);
+}
+
+static void serial_list_nets() {
+    int idx[MAX_APS];
+    int n = ap_sorted(idx);
+    Serial.printf("networks: %d\n", n);
+    for (int i = 0; i < n; i++) {
+        ap_t *a = &aps[idx[i]];
+        Serial.printf("  %-20s %s ch=%-2d rssi=%-4d %s\n",
+                      a->ssid[0] ? a->ssid : "<hidden>",
+                      mac2str(a->bssid).c_str(), a->channel, a->rssi,
+                      a->enc ? "enc" : "open");
+    }
+}
+
+static void serial_list_threats() {
+    Serial.printf("deauth events: %u (last %d kept)\n", s_deauth, threat_count);
+    uint32_t now = millis();
+    for (int k = 1; k <= MAX_THREATS && k <= threat_count; k++) {
+        int i = (threat_next - k + MAX_THREATS) % MAX_THREATS;
+        threat_t *t = &threats[i];
+        Serial.printf("  src=%s dst=%s ch=%d rssi=%d age=%us\n",
+                      mac2str(t->src).c_str(), mac2str(t->dst).c_str(),
+                      t->channel, t->rssi, (now - t->ts) / 1000);
+    }
+}
+
+static void serial_status() {
+    Serial.printf("status: up=%us ch=%d%s pkts=%u (mgmt=%u ctrl=%u data=%u beacon=%u) "
+                  "deauth=%u eapol=%u aps=%u rate=%u/s page=%s sd=%s usb=%s heap=%u\n",
+                  (millis() - boot_ms) / 1000, current_channel, ch_lock ? "(lock)" : "",
+                  s_total, s_mgmt, s_ctrl, s_data, s_beacon, s_deauth, s_eapol,
+                  ap_active(), last_rate, PAGE_NAME[page],
+                  sd_ok ? "on" : "off", msc_mode ? "mounted" : "idle",
+                  ESP.getFreeHeap());
+}
+
+static void serial_help() {
+    Serial.println(F(
+        "commands:\n"
+        "  help                 this list\n"
+        "  status               one-line summary of everything\n"
+        "  page <name|next|prev|0-5>   switch page (live/channels/networks/threats/system/usb)\n"
+        "  channel <1-13>       lock to a channel\n"
+        "  lock | unlock | hop  stop / resume channel hopping\n"
+        "  nets                 list discovered networks\n"
+        "  threats              list captured deauth events\n"
+        "  reset                clear all counters and tables\n"
+        "  usb on | usb off     mount / eject the SD card as a USB drive\n"
+        "  sd                   logging / card status\n"
+        "  reboot               restart the device"));
+}
+
+static void serial_exec(char *line) {
+    // Tokenise on spaces.
+    char *cmd = strtok(line, " \t");
+    if (!cmd) return;
+    char *arg = strtok(nullptr, " \t");
+
+    if (!strcasecmp(cmd, "help") || !strcasecmp(cmd, "?")) { serial_help(); return; }
+    if (!strcasecmp(cmd, "status")) { serial_status(); return; }
+    if (!strcasecmp(cmd, "nets") || !strcasecmp(cmd, "networks")) { serial_list_nets(); return; }
+    if (!strcasecmp(cmd, "threats")) { serial_list_threats(); return; }
+
+    if (!strcasecmp(cmd, "reset")) { reset_stats(); Serial.println("ok: cleared"); return; }
+    if (!strcasecmp(cmd, "lock"))   { ch_lock = true;  Serial.println("ok: locked");   return; }
+    if (!strcasecmp(cmd, "unlock") || !strcasecmp(cmd, "hop")) { ch_lock = false; Serial.println("ok: hopping"); return; }
+    if (!strcasecmp(cmd, "reboot") || !strcasecmp(cmd, "restart")) { Serial.println("rebooting..."); delay(50); ESP.restart(); return; }
+
+    if (!strcasecmp(cmd, "channel") || !strcasecmp(cmd, "ch")) {
+        if (!arg) { Serial.println("usage: channel <1-13>"); return; }
+        serial_set_channel(atoi(arg));
+        return;
+    }
+
+    if (!strcasecmp(cmd, "sd") || !strcasecmp(cmd, "log")) {
+        if (sd_ok) Serial.printf("sd: logging on, session %d, eapol=%u hs=%u\n", log_session, s_eapol, hs_saved);
+        else if (msc_mode) Serial.println("sd: mounted as USB drive (logging paused)");
+        else Serial.println("sd: no card / logging off");
+        return;
+    }
+
+    if (!strcasecmp(cmd, "usb")) {
+        if (arg && !strcasecmp(arg, "on")) {
+            if (msc_mode) Serial.println("usb: already mounted");
+            else if (!msc_registered) Serial.println("usb: no card at boot");
+            else Serial.println(msc_enter() ? "usb: mounted (logging paused)" : "usb: mount failed");
+        } else if (arg && !strcasecmp(arg, "off")) {
+            if (!msc_mode) Serial.println("usb: not mounted");
+            else { msc_exit(); Serial.println("usb: ejected, logging resumed"); }
+        } else Serial.println("usage: usb on | usb off");
+        return;
+    }
+
+    if (!strcasecmp(cmd, "page")) {
+        if (!arg) { Serial.printf("page: %s\n", PAGE_NAME[page]); return; }
+        if (!strcasecmp(arg, "next")) { goto_page(page + 1); }
+        else if (!strcasecmp(arg, "prev")) { goto_page(page - 1); }
+        else if (arg[0] >= '0' && arg[0] <= '9') { goto_page(atoi(arg) % PAGE_COUNT); }
+        else {
+            int found = -1;
+            for (int i = 0; i < PAGE_COUNT; i++) if (!strcasecmp(arg, PAGE_NAME[i])) found = i;
+            if (found < 0) { Serial.println("err: unknown page"); return; }
+            goto_page(found);
+        }
+        Serial.printf("ok: page %s\n", PAGE_NAME[page]);
+        return;
+    }
+
+    Serial.printf("unknown command '%s' - type help\n", cmd);
+}
+
+// Non-blocking line reader, called every loop.
+static void serial_poll() {
+    static char buf[80];
+    static uint8_t len = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (len) { buf[len] = '\0'; serial_exec(buf); len = 0; }
+        } else if (len < sizeof(buf) - 1) {
+            buf[len++] = c;
+        }
+    }
+}
+
 // ─── Setup ─────────────────────────────────────────────────────────────────
 void setup() {
     delay(300);
@@ -1320,6 +1456,7 @@ void setup() {
     fps_ts = rate_window_ts = boot_ms;
     wifi_sniffer_init();
     Serial.printf("[poppn] Sniffer started, free heap %u\n", ESP.getFreeHeap());
+    Serial.println("[poppn] serial console ready - type 'help'");
 }
 
 // ─── Loop ──────────────────────────────────────────────────────────────────
@@ -1330,6 +1467,7 @@ static uint32_t btn_t0 = 0;
 void loop() {
     uint32_t now = millis();
 
+    serial_poll();
     drain_events();
 
     // Channel hopping

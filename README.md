@@ -105,6 +105,23 @@ and a heartbeat lands every 10 s, so a host can log the run without watching the
 [stat] pkts=48213 (mgmt=9120 ctrl=6034 data=33059 beacon=8871) deauth=0 aps=14 rate=412/s ch=9 dropped=0 heap=241184
 ```
 
+## Serial console
+
+The USB serial port is also a **command console** — everything the button does, plus queries, driven
+from a laptop or phone terminal (115200 baud, pick the CDC serial port). Type `help` for the list.
+
+| Command | Effect |
+|---|---|
+| `help` / `status` | list commands / one-line summary of everything |
+| `page <name\|next\|prev\|0-5>` | switch page |
+| `channel <1-13>` · `lock` · `unlock` | lock to a channel / stop / resume hopping |
+| `nets` · `threats` | list networks / deauth events |
+| `reset` | clear all counters and tables |
+| `usb on` · `usb off` | mount / eject the SD card as a USB drive |
+| `sd` · `reboot` | logging status / restart |
+
+Full reference with examples: **[docs/SERIAL.md](docs/SERIAL.md)**.
+
 ## How it works
 
 The promiscuous callback runs in the WiFi task and stays short: it bumps counters and pushes
