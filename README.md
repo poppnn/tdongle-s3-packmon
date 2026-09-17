@@ -161,16 +161,21 @@ to raise your odds. This is receive-only; packmon never sends deauth frames to f
 ## Log viewer
 
 `docs/viewer.html` (live at **<https://poppnn.github.io/tdongle-s3-packmon/viewer.html>**) is a
-single self-contained page — drop a session's CSV files onto it and it renders, entirely in your
-browser with nothing uploaded:
+single self-contained page — drop a whole session onto it (the CSVs **and** the `.pcap` files) and it
+renders everything, entirely in your browser with nothing uploaded:
 
 - a **spider / radar chart** of per-channel activity (the "toile d'araignée")
 - a second radar of the frame-type mix (mgmt / ctrl / data / beacon / deauth)
 - a traffic timeline (packets/s and cumulative deauth on a dual axis)
 - a deauth-event bar chart coloured by signal strength
 - a sortable table of every network seen
+- a **handshake decoder** for the `.pcap` files: it parses the 802.11 frames client-side and, per
+  AP + client pair, shows the SSID (matched from a captured beacon), both MACs, which of the four
+  EAPOL messages M1–M4 were caught, and whether the pair is **crackable** (has an ANonce from M1/M3
+  and a MIC from M2/M4)
 
-There is a **Load demo data** button to see the layout without a card.
+There is a **Load demo data** button to see the whole layout — including a synthetic four-way
+handshake — without a card.
 
 ## Rebuilding the web flasher image
 

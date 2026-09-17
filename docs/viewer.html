@@ -65,6 +65,11 @@
   tr:hover td{background:var(--panel2);}
   .mac{color:var(--label);}
   .enc{color:var(--warn);} .open{color:var(--ok);}
+  .m{display:inline-block;width:20px;text-align:center;border-radius:4px;font-size:11px;font-weight:700;margin-right:3px;border:1px solid var(--sep);color:var(--sep);}
+  .m.on{background:rgba(0,255,189,.16);border-color:var(--accent-d);color:var(--accent);}
+  .badge{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;font-weight:700;}
+  .badge.ok{background:rgba(33,206,33,.16);color:var(--ok);}
+  .badge.part{background:rgba(255,161,0,.16);color:var(--warn);}
   .hs-note{border-left:2px solid var(--accent-d);background:rgba(0,255,189,.05);padding:12px 16px;border-radius:0 8px 8px 0;font-size:12.5px;color:#b9c2be;margin-top:18px;}
   code{background:var(--panel2);border:1px solid var(--sep);border-radius:4px;padding:1px 5px;color:var(--accent);font-size:12px;}
   footer{text-align:center;color:var(--label);font-size:12px;margin-top:34px;padding-top:20px;border-top:1px solid var(--sep);}
@@ -80,13 +85,13 @@
   </header>
 
   <div class="drop" id="drop">
-    <h2>Drop CSV files here</h2>
-    <p>the <b>events</b>, <b>networks</b> and <b>stats</b> files from one session — or all at once</p>
+    <h2>Drop your packmon files here</h2>
+    <p>the <b>events</b>, <b>networks</b> and <b>stats</b> CSVs <span style="color:var(--sep)">+</span> the <b>.pcap</b> handshake captures — all at once, whole card if you like</p>
     <div class="btnrow">
       <button class="btn" id="pick">Choose files</button>
       <button class="btn ghost" id="demo">Load demo data</button>
     </div>
-    <input type="file" id="file" accept=".csv" multiple hidden>
+    <input type="file" id="file" accept=".csv,.pcap,.cap" multiple hidden>
     <div class="loaded" id="loaded"></div>
   </div>
 
@@ -101,6 +106,12 @@
     <div class="panel" style="margin-bottom:18px;"><h3>Traffic over time</h3><canvas id="lineTraffic" height="150"></canvas></div>
 
     <div class="panel" style="margin-bottom:18px;"><h3>Deauth events</h3><canvas id="deauthChart" height="140"></canvas></div>
+
+    <div class="panel" id="hsPanel" style="display:none;margin-bottom:18px;">
+      <h3>Handshake captures (.pcap)</h3>
+      <div id="hsSummary" style="font-size:12.5px;color:var(--label);margin-bottom:12px;"></div>
+      <div style="overflow-x:auto;"><table id="hsTable"><thead></thead><tbody></tbody></table></div>
+    </div>
 
     <div class="panel">
       <h3>Networks seen</h3>
@@ -127,6 +138,10 @@ Chart.defaults.font.family = col('--mono');
 Chart.defaults.font.size = 11;
 
 const store = { events:null, networks:null, stats:null };
+// Handshake aggregation, merged across every pcap dropped.
+const hs = { files:0, frames:0, eapol:0, beacons:0, badpcap:0,
+             ssid:{},                 // bssid -> ssid (from beacons)
+             pairs:{} };              // "bssid|sta" -> {ap, sta, m:[0,0,0,0], replay}
 let charts = [];
 
 // ── CSV parsing ────────────────────────────────────────────────────────────
@@ -156,6 +171,91 @@ function classify(head){
   return null;
 }
 
+// ── pcap parsing (client-side, no upload) ────────────────────────────────────
+const mac = (dv,o)=>{ let s=[]; for(let i=0;i<6;i++) s.push(dv.getUint8(o+i).toString(16).padStart(2,'0')); return s.join(':'); };
+const isZero = (dv,o,n)=>{ for(let i=0;i<n;i++) if(dv.getUint8(o+i)) return false; return true; };
+
+// Which of the four handshake messages a Key Information field describes.
+function eapolMsg(ki){
+  const mic=ki&0x0100, ack=ki&0x0080, inst=ki&0x0040, sec=ki&0x0200;
+  if(ack && !mic)              return 1;   // AP -> STA, ANonce
+  if(!ack && mic && !sec)      return 2;   // STA -> AP, SNonce + MIC
+  if(ack && mic && inst)       return 3;   // AP -> STA, install
+  if(!ack && mic && sec)       return 4;   // STA -> AP, ack
+  return 0;
+}
+
+// Parse one 802.11 frame (already past any radiotap). Fills hs.* aggregates.
+function parse80211(dv, off, end){
+  if(off+24 > end) return;
+  const fc = dv.getUint8(off) | (dv.getUint8(off+1)<<8);
+  const type=(fc>>2)&3, sub=(fc>>4)&0xF, toDS=fc&0x0100, fromDS=fc&0x0200, prot=fc&0x4000;
+
+  if(type===0 && sub===8){                                   // beacon
+    hs.beacons++;
+    const bssid = mac(dv, off+16);
+    let i = off+24+12, ssid=null;                            // skip fixed params
+    while(i+2 <= end){
+      const tag=dv.getUint8(i), len=dv.getUint8(i+1);
+      if(i+2+len>end) break;
+      if(tag===0){ ssid=''; for(let k=0;k<len;k++){ const c=dv.getUint8(i+2+k); ssid += (c>=32&&c<127)?String.fromCharCode(c):''; } }
+      i += 2+len;
+    }
+    if(ssid && !hs.ssid[bssid]) hs.ssid[bssid]=ssid;
+    return;
+  }
+
+  if(type!==2 || prot) return;                               // data only, unencrypted
+  let hdr = 24;
+  if(sub & 0x08) hdr += 2;                                   // QoS
+  if(toDS && fromDS) hdr += 6;                               // 4-addr
+  if(off+hdr+8 > end) return;
+  // LLC/SNAP + ethertype 0x888E
+  if(dv.getUint8(off+hdr)!==0xAA || dv.getUint8(off+hdr+1)!==0xAA ||
+     dv.getUint8(off+hdr+2)!==0x03 || dv.getUint8(off+hdr+6)!==0x88 || dv.getUint8(off+hdr+7)!==0x8E) return;
+
+  hs.eapol++;
+  const e = off+hdr+8;                                       // EAPOL header
+  if(e+7 > end) return;
+  if(dv.getUint8(e+1)!==3) return;                           // EAPOL-Key type
+  const ki = (dv.getUint8(e+5)<<8) | dv.getUint8(e+6);       // Key Information (BE)
+  const msg = eapolMsg(ki);
+  if(!msg) return;
+  const ap  = fromDS ? mac(dv,off+10) : mac(dv,off+4);
+  const sta = fromDS ? mac(dv,off+4)  : mac(dv,off+10);
+  const key = ap+'|'+sta;
+  const p = hs.pairs[key] || (hs.pairs[key]={ ap, sta, m:[0,0,0,0], replay:0 });
+  p.m[msg-1]++;
+  if(e+16 <= end) p.replay = dv.getUint32(e+13);             // low 32 bits of replay counter
+}
+
+function parsePcap(buf){
+  hs.files++;
+  const dv = new DataView(buf);
+  if(dv.byteLength < 24){ hs.badpcap++; return; }
+  const magic = dv.getUint32(0);   // read big-endian; the value tells us the file's order
+  let le;
+  if(magic===0xa1b2c3d4 || magic===0xa1b23c4d) le=false;     // bytes a1 b2 c3 d4 -> big-endian file
+  else if(magic===0xd4c3b2a1 || magic===0x4d3cb2a1) le=true; // byte-swapped -> little-endian file (our writer)
+  else { hs.badpcap++; return; }
+  const linktype = dv.getUint32(20, le);
+  let o = 24;
+  while(o+16 <= dv.byteLength){
+    const incl = dv.getUint32(o+8, le);
+    o += 16;
+    if(incl<=0 || o+incl > dv.byteLength) break;
+    hs.frames++;
+    let fo = o;
+    if(linktype===127){                                      // radiotap: skip it
+      const rtlen = dv.getUint16(fo+2, true);
+      if(rtlen>0 && fo+rtlen < o+incl) fo += rtlen;
+    }
+    // frame bytes are big-endian on the wire; read via a BE-agnostic view
+    parse80211(new DataView(buf, 0), fo, o+incl);
+    o += incl;
+  }
+}
+
 // ── File intake ────────────────────────────────────────────────────────────
 function ingest(name, text){
   const p = parseCSV(text);
@@ -166,21 +266,24 @@ function ingest(name, text){
 }
 function readFiles(files){
   let pending = files.length, got = [];
+  const finish = k => { if(k) got.push(k); if(--pending===0) done(got); };
   [...files].forEach(f=>{
     const r = new FileReader();
-    r.onload = () => {
-      const k = ingest(f.name, r.result);
-      if(k) got.push(k);
-      if(--pending===0) done(got);
-    };
-    r.readAsText(f);
+    if(/\.(pcap|cap)$/i.test(f.name)){
+      r.onload = () => { try{ parsePcap(r.result); finish('pcap'); }catch(e){ hs.badpcap++; finish(null); } };
+      r.readAsArrayBuffer(f);
+    } else {
+      r.onload = () => finish(ingest(f.name, r.result));
+      r.readAsText(f);
+    }
   });
 }
 function done(got){
   const have = ['events','networks','stats'].filter(k=>store[k]);
+  if(got.includes('pcap')) have.push(hs.files+' pcap');
   document.getElementById('loaded').innerHTML =
-    have.length ? 'loaded: <b>'+have.join('</b>, <b>')+'</b>' : 'no recognised packmon CSV in that selection';
-  if(have.length) render();
+    have.length ? 'loaded: <b>'+have.join('</b>, <b>')+'</b>' : 'no recognised packmon files in that selection';
+  if(have.length || hs.frames) render();
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────────
@@ -206,6 +309,8 @@ function render(){
   const dur = durSec>3600 ? (durSec/3600).toFixed(1)+'h' : durSec>60 ? Math.round(durSec/60)+'m' : Math.round(durSec)+'s';
   const total = last ? +last.total : ev.length;
   const deauth = last ? +last.deauth : ev.length;
+  const pairs = Object.values(hs.pairs);
+  const complete = pairs.filter(p=>(p.m[0]||p.m[2]) && (p.m[1]||p.m[3])).length;
   const cards = [
     ['Duration', dur, ''],
     ['Packets', num(total), 'acc'],
@@ -213,6 +318,10 @@ function render(){
     ['Deauth', num(deauth), deauth>0?'dan':''],
     ['Busiest ch', st.length||ev.length||nets.length ? ('CH'+busiest) : '—', 'acc'],
   ];
+  if(hs.frames){
+    cards.push(['EAPOL', num(hs.eapol), 'acc']);
+    cards.push(['Handshakes', complete+' / '+pairs.length, complete?'acc':'']);
+  }
   document.getElementById('cards').innerHTML = cards.map(c=>
     `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
 
@@ -271,12 +380,51 @@ function render(){
   // Networks table
   renderNetTable(nets);
 
+  // Handshakes from the pcap(s)
+  renderHandshakes();
+
   // Handshake note
-  const hs = document.getElementById('hsNote');
-  hs.style.display='block';
-  hs.innerHTML = 'Handshake captures live separately in <code>packmon-hs/sNNNN.pcap</code> on the card. '+
-    'Open them with Wireshark, or convert to a hashcat 22000 file with '+
-    '<code>hcxpcapngtool -o hs.22000 sNNNN.pcap</code>.';
+  const note = document.getElementById('hsNote');
+  note.style.display='block';
+  note.innerHTML = hs.frames
+    ? 'Convert a capture to a hashcat 22000 file with <code>hcxpcapngtool -o hs.22000 sNNNN.pcap</code>, '+
+      'then <code>hashcat -m 22000 hs.22000 wordlist.txt</code>. Only run this against networks you own or are authorised to test.'
+    : 'Drop the <code>packmon-hs/sNNNN.pcap</code> files too and this page will decode the handshakes it caught.';
+}
+
+function renderHandshakes(){
+  const panel = document.getElementById('hsPanel');
+  if(!hs.frames){ panel.style.display='none'; return; }
+  panel.style.display='block';
+
+  document.getElementById('hsSummary').innerHTML =
+    `<b style="color:var(--text)">${hs.files}</b> pcap · <b style="color:var(--text)">${hs.frames}</b> frames · `+
+    `<b style="color:var(--accent)">${hs.eapol}</b> EAPOL · ${hs.beacons} beacons`+
+    (hs.badpcap?` · <span style="color:var(--danger)">${hs.badpcap} unreadable</span>`:'');
+
+  const pairs = Object.values(hs.pairs).sort((a,b)=>
+    (b.m[0]+b.m[1]+b.m[2]+b.m[3])-(a.m[0]+a.m[1]+a.m[2]+a.m[3]));
+  const thead = document.querySelector('#hsTable thead');
+  const tbody = document.querySelector('#hsTable tbody');
+
+  if(!pairs.length){
+    thead.innerHTML=''; tbody.innerHTML =
+      '<tr><td style="color:var(--label)">EAPOL frames were seen but no message could be classified.</td></tr>';
+    return;
+  }
+  thead.innerHTML = '<tr><th>NETWORK (SSID)</th><th>AP BSSID</th><th>CLIENT</th><th>M1 M2 M3 M4</th><th>STATUS</th></tr>';
+  tbody.innerHTML = pairs.map(p=>{
+    const got = p.m.map((c,i)=>`<span class="m ${c?'on':''}">${i+1}</span>`).join('');
+    const crack = (p.m[0]||p.m[2]) && (p.m[1]||p.m[3]);
+    const status = crack ? '<span class="badge ok">crackable</span>' : '<span class="badge part">partial</span>';
+    const ssid = hs.ssid[p.ap];
+    return `<tr>
+      <td>${ssid?esc(ssid):'<span class="mac">&lt;unknown&gt;</span>'}</td>
+      <td class="mac">${p.ap}</td>
+      <td class="mac">${p.sta}</td>
+      <td style="white-space:nowrap">${got}</td>
+      <td>${status}</td></tr>`;
+  }).join('');
 }
 
 function radarOpts(){
@@ -352,8 +500,46 @@ document.getElementById('demo').onclick = e=>{
   ingest('demo-networks.csv',netCsv);
   ingest('demo-events.csv',evCsv);
   ingest('demo-stats.csv',stCsv);
-  done(['events','networks','stats']);
+
+  // A synthetic capture: one beacon + a full four-way handshake, so the
+  // handshake decoder has something real to chew on.
+  hs.files=0; hs.frames=0; hs.eapol=0; hs.beacons=0; hs.badpcap=0; hs.ssid={}; hs.pairs={};
+  parsePcap(buildDemoPcap());
+
+  done(['events','networks','stats','pcap']);
 };
+
+// Build a valid little-endian libpcap (linktype 105) in memory for the demo.
+function buildDemoPcap(){
+  const b=[];
+  const u16=v=>{b.push(v&0xff,(v>>8)&0xff);};
+  const u32=v=>{b.push(v&0xff,(v>>8)&0xff,(v>>16)&0xff,(v>>>24)&0xff);};
+  // global header
+  u32(0xa1b2c3d4); u16(2); u16(4); u32(0); u32(0); u32(65535); u32(105);
+  const AP=[0x00,0x11,0x22,0x33,0x44,0x55], STA=[0xAA,0xBB,0xCC,0xDD,0xEE,0xFF];
+  const rec=frame=>{ u32(0); u32(0); u32(frame.length); u32(frame.length); frame.forEach(x=>b.push(x)); };
+  const hdr=(fc,a1,a2,a3)=>[fc&0xff,(fc>>8)&0xff, 0,0, ...a1, ...a2, ...a3, 0,0];
+  // beacon (SSID "HomeNet", DS channel 6)
+  const ssid=[...'HomeNet'].map(c=>c.charCodeAt(0));
+  rec([...hdr(0x0080,[0xff,0xff,0xff,0xff,0xff,0xff],AP,AP),
+       0,0,0,0,0,0,0,0, 0x64,0,0x11,0x04,        // fixed params (timestamp/interval/caps)
+       0,ssid.length,...ssid, 3,1,6]);
+  // EAPOL-Key M1..M4. Body layout: version,type(3),length(2),descType,
+  // keyInfo(2),keyLen(2),replay(8),nonce(32),iv(16),rsc(8),id(8),mic(16),kdl(2)
+  const eapol=(fromDS,ki)=>{
+    const a1=fromDS?STA:AP, a2=fromDS?AP:STA;
+    const body=[2,3, 0,0, 2, (ki>>8)&0xff, ki&0xff, 0,16, 0,0,0,0,0,0,0,1];
+    while(body.length<99) body.push(0);
+    const plen=body.length-4; body[2]=(plen>>8)&0xff; body[3]=plen&0xff;
+    return [...hdr(fromDS?0x0208:0x0108,a1,a2,AP),
+            0xAA,0xAA,0x03,0,0,0,0x88,0x8E, ...body];
+  };
+  rec(eapol(true, 0x008a));   // M1  ACK
+  rec(eapol(false,0x010a));   // M2  MIC
+  rec(eapol(true, 0x03ca));   // M3  ACK+MIC+install+secure
+  rec(eapol(false,0x0302));   // M4  MIC+secure
+  return new Uint8Array(b).buffer;
+}
 </script>
 </body>
 </html>
