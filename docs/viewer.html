@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>poppn packmon — Log Viewer</title>
+<meta name="description" content="Turn poppn packmon SD-card CSV logs into interactive spider charts, timelines and a network table — entirely in your browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
+<style>
+  :root {
+    --bg:#080808; --panel:#121212; --panel2:#191c1a; --sep:#262626;
+    --text:#dedede; --label:#6b6d6b; --accent:#00ffbd; --accent-d:#006e54;
+    --blue:#4a8eff; --warn:#ffa100; --danger:#ff2020; --ok:#21ce21;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--bg);
+    background-image:
+      radial-gradient(900px 500px at 50% -10%,rgba(0,255,189,.09),transparent 70%),
+      radial-gradient(700px 400px at 90% 110%,rgba(74,142,255,.07),transparent 70%);
+    color:var(--text);font-family:var(--mono);font-size:14px;line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1000px;margin:0 auto;padding:36px 16px 80px;}
+  header{text-align:center;margin-bottom:28px;}
+  .logo{font-size:clamp(30px,9vw,46px);font-weight:700;letter-spacing:.04em;color:var(--accent);text-shadow:0 0 24px rgba(0,255,189,.35);margin:0;}
+  .rule{width:150px;height:2px;margin:10px auto 12px;background:linear-gradient(90deg,transparent,var(--accent),transparent);}
+  .tag{color:var(--text);margin:0;}
+  .sub{color:var(--label);font-size:12.5px;margin:4px 0 0;}
+  a{color:var(--blue);text-decoration:none;} a:hover{text-decoration:underline;}
+
+  .drop{
+    border:1.5px dashed var(--sep);border-radius:12px;background:var(--panel);
+    padding:28px 20px;text-align:center;transition:border-color .15s,background .15s;cursor:pointer;
+  }
+  .drop.over{border-color:var(--accent);background:var(--panel2);}
+  .drop h2{margin:0 0 6px;font-size:15px;color:var(--text);}
+  .drop p{margin:4px 0;color:var(--label);font-size:12.5px;}
+  .btnrow{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:14px;}
+  .btn{background:var(--accent);color:#041410;border:0;border-radius:8px;padding:10px 20px;font-family:var(--mono);font-size:14px;font-weight:700;cursor:pointer;transition:transform .12s,box-shadow .12s;}
+  .btn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,255,189,.22);}
+  .btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent-d);}
+  .loaded{margin-top:12px;font-size:12px;color:var(--label);min-height:1em;}
+  .loaded b{color:var(--accent);}
+
+  #dash{display:none;margin-top:26px;}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:22px;}
+  .card{background:var(--panel);border:1px solid var(--sep);border-radius:10px;padding:14px;}
+  .card .k{color:var(--label);font-size:11px;letter-spacing:.12em;text-transform:uppercase;}
+  .card .v{color:var(--text);font-size:22px;font-weight:700;margin-top:4px;}
+  .card .v.acc{color:var(--accent);} .card .v.dan{color:var(--danger);}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px;}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr;}}
+  .panel{background:var(--panel);border:1px solid var(--sep);border-radius:12px;padding:18px;}
+  .panel h3{margin:0 0 12px;font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--label);font-weight:600;}
+  canvas{max-width:100%;}
+
+  table{width:100%;border-collapse:collapse;font-size:12.5px;}
+  th{color:var(--label);text-align:left;font-weight:600;padding:6px 8px;border-bottom:1px solid var(--sep);cursor:pointer;user-select:none;}
+  th:hover{color:var(--accent);}
+  td{padding:6px 8px;border-bottom:1px solid var(--panel2);}
+  tr:hover td{background:var(--panel2);}
+  .mac{color:var(--label);}
+  .enc{color:var(--warn);} .open{color:var(--ok);}
+  .hs-note{border-left:2px solid var(--accent-d);background:rgba(0,255,189,.05);padding:12px 16px;border-radius:0 8px 8px 0;font-size:12.5px;color:#b9c2be;margin-top:18px;}
+  code{background:var(--panel2);border:1px solid var(--sep);border-radius:4px;padding:1px 5px;color:var(--accent);font-size:12px;}
+  footer{text-align:center;color:var(--label);font-size:12px;margin-top:34px;padding-top:20px;border-top:1px solid var(--sep);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 class="logo">poppn</h1>
+    <div class="rule"></div>
+    <p class="tag">Log Viewer</p>
+    <p class="sub">drop your <code>packmon-logs</code> CSV files — everything runs in your browser, nothing is uploaded</p>
+  </header>
+
+  <div class="drop" id="drop">
+    <h2>Drop CSV files here</h2>
+    <p>the <b>events</b>, <b>networks</b> and <b>stats</b> files from one session — or all at once</p>
+    <div class="btnrow">
+      <button class="btn" id="pick">Choose files</button>
+      <button class="btn ghost" id="demo">Load demo data</button>
+    </div>
+    <input type="file" id="file" accept=".csv" multiple hidden>
+    <div class="loaded" id="loaded"></div>
+  </div>
+
+  <div id="dash">
+    <div class="cards" id="cards"></div>
+
+    <div class="grid2">
+      <div class="panel"><h3>Channel activity</h3><canvas id="radarCh" height="260"></canvas></div>
+      <div class="panel"><h3>Frame mix</h3><canvas id="radarFrame" height="260"></canvas></div>
+    </div>
+
+    <div class="panel" style="margin-bottom:18px;"><h3>Traffic over time</h3><canvas id="lineTraffic" height="150"></canvas></div>
+
+    <div class="panel" style="margin-bottom:18px;"><h3>Deauth events</h3><canvas id="deauthChart" height="140"></canvas></div>
+
+    <div class="panel">
+      <h3>Networks seen</h3>
+      <div style="overflow-x:auto;"><table id="netTable"><thead></thead><tbody></tbody></table></div>
+    </div>
+
+    <div class="hs-note" id="hsNote" style="display:none;"></div>
+  </div>
+
+  <footer>
+    part of <a href="./">poppn packmon</a> · <a href="https://github.com/poppnn/tdongle-s3-packmon">source on GitHub</a>
+  </footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const CH = getComputedStyle(document.documentElement);
+const col = n => CH.getPropertyValue(n).trim();
+const ACCENT = col('--accent'), BLUE = col('--blue'), DANGER = col('--danger'),
+      WARN = col('--warn'), LABEL = col('--label'), SEP = col('--sep'), TEXT = col('--text');
+
+Chart.defaults.color = LABEL;
+Chart.defaults.font.family = col('--mono');
+Chart.defaults.font.size = 11;
+
+const store = { events:null, networks:null, stats:null };
+let charts = [];
+
+// ── CSV parsing ────────────────────────────────────────────────────────────
+function parseCSV(text){
+  const lines = text.replace(/\r/g,'').split('\n').filter(l=>l.length);
+  if(!lines.length) return null;
+  const head = lines[0].split(',');
+  const rows = lines.slice(1).map(l=>{
+    const c = l.split(',');
+    const o = {};
+    head.forEach((h,i)=>o[h.trim()] = (c[i]??'').trim());
+    return o;
+  });
+  return { head, rows };
+}
+// "HH:MM:SS.mmm" -> seconds
+function stampSec(s){
+  const m = /^(\d+):(\d+):(\d+)(?:\.(\d+))?/.exec(s||'');
+  if(!m) return 0;
+  return (+m[1])*3600 + (+m[2])*60 + (+m[3]) + (m[4]?(+('0.'+m[4])):0);
+}
+function classify(head){
+  const h = head.join(',');
+  if(h.startsWith('time,type,channel,rssi')) return 'events';
+  if(h.startsWith('time,bssid,ssid'))        return 'networks';
+  if(h.startsWith('time,total,mgmt'))        return 'stats';
+  return null;
+}
+
+// ── File intake ────────────────────────────────────────────────────────────
+function ingest(name, text){
+  const p = parseCSV(text);
+  if(!p) return null;
+  const kind = classify(p.head);
+  if(kind) store[kind] = p.rows;
+  return kind;
+}
+function readFiles(files){
+  let pending = files.length, got = [];
+  [...files].forEach(f=>{
+    const r = new FileReader();
+    r.onload = () => {
+      const k = ingest(f.name, r.result);
+      if(k) got.push(k);
+      if(--pending===0) done(got);
+    };
+    r.readAsText(f);
+  });
+}
+function done(got){
+  const have = ['events','networks','stats'].filter(k=>store[k]);
+  document.getElementById('loaded').innerHTML =
+    have.length ? 'loaded: <b>'+have.join('</b>, <b>')+'</b>' : 'no recognised packmon CSV in that selection';
+  if(have.length) render();
+}
+
+// ── Rendering ──────────────────────────────────────────────────────────────
+function destroyCharts(){ charts.forEach(c=>c.destroy()); charts = []; }
+function num(v){ v=+v||0; return v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(1)+'k':''+v; }
+
+function render(){
+  destroyCharts();
+  document.getElementById('dash').style.display='block';
+  const st = store.stats||[], ev = store.events||[], nets = store.networks||[];
+  const last = st.length ? st[st.length-1] : null;
+
+  // Per-channel counts: prefer cumulative stats, else count sightings.
+  const chVals = [];
+  for(let c=1;c<=13;c++){
+    if(last && ('ch'+c) in last) chVals.push(+last['ch'+c]||0);
+    else chVals.push(ev.filter(e=>+e.channel===c).length + nets.filter(n=>+n.channel===c).length);
+  }
+  const chMax = Math.max(1,...chVals), busiest = chVals.indexOf(chMax)+1;
+
+  // Summary cards
+  const durSec = st.length ? stampSec(st[st.length-1].time) - stampSec(st[0].time) : 0;
+  const dur = durSec>3600 ? (durSec/3600).toFixed(1)+'h' : durSec>60 ? Math.round(durSec/60)+'m' : Math.round(durSec)+'s';
+  const total = last ? +last.total : ev.length;
+  const deauth = last ? +last.deauth : ev.length;
+  const cards = [
+    ['Duration', dur, ''],
+    ['Packets', num(total), 'acc'],
+    ['Networks', nets.length||'—', ''],
+    ['Deauth', num(deauth), deauth>0?'dan':''],
+    ['Busiest ch', st.length||ev.length||nets.length ? ('CH'+busiest) : '—', 'acc'],
+  ];
+  document.getElementById('cards').innerHTML = cards.map(c=>
+    `<div class="card"><div class="k">${c[0]}</div><div class="v ${c[2]}">${c[1]}</div></div>`).join('');
+
+  // Radar: channel activity (the spider / toile d'araignée)
+  charts.push(new Chart(document.getElementById('radarCh'),{
+    type:'radar',
+    data:{ labels:[...Array(13)].map((_,i)=>'CH'+(i+1)),
+      datasets:[{ label:'frames', data:chVals, borderColor:ACCENT,
+        backgroundColor:'rgba(0,255,189,.18)', pointBackgroundColor:ACCENT, borderWidth:2, pointRadius:2 }]},
+    options:radarOpts()
+  }));
+
+  // Radar: frame mix
+  const mix = last
+    ? [+last.mgmt||0, +last.ctrl||0, +last.data||0, +last.beacon||0, +last.deauth||0]
+    : [0,0,0,0,ev.length];
+  charts.push(new Chart(document.getElementById('radarFrame'),{
+    type:'radar',
+    data:{ labels:['mgmt','ctrl','data','beacon','deauth'],
+      datasets:[{ label:'frames', data:mix, borderColor:BLUE,
+        backgroundColor:'rgba(74,142,255,.16)', pointBackgroundColor:BLUE, borderWidth:2, pointRadius:2 }]},
+    options:radarOpts()
+  }));
+
+  // Line: cumulative total + per-window rate
+  if(st.length){
+    const t0 = stampSec(st[0].time);
+    const labels = st.map(r=>Math.round(stampSec(r.time)-t0)+'s');
+    charts.push(new Chart(document.getElementById('lineTraffic'),{
+      type:'line',
+      data:{ labels, datasets:[
+        { label:'packets/s', data:st.map(r=>+r.rate||0), yAxisID:'y', borderColor:ACCENT, backgroundColor:'rgba(0,255,189,.12)', fill:true, tension:.3, pointRadius:0, borderWidth:2 },
+        { label:'deauth (cum)', data:st.map(r=>+r.deauth||0), yAxisID:'y1', borderColor:DANGER, tension:.3, pointRadius:0, borderWidth:1.5 },
+      ]},
+      options:{ responsive:true, interaction:{mode:'index',intersect:false},
+        scales:{ x:{grid:{color:SEP}}, y:{position:'left',grid:{color:SEP},title:{display:true,text:'pkt/s'}},
+                 y1:{position:'right',grid:{display:false},title:{display:true,text:'deauth'}} },
+        plugins:{legend:{labels:{boxWidth:12}}} }
+    }));
+  } else document.getElementById('lineTraffic').parentElement.style.display='none';
+
+  // Deauth events over time, coloured by RSSI, one bar per event
+  if(ev.length){
+    const t0 = stampSec(ev[0].time);
+    charts.push(new Chart(document.getElementById('deauthChart'),{
+      type:'bar',
+      data:{ labels:ev.map(e=>Math.round(stampSec(e.time)-t0)+'s'),
+        datasets:[{ label:'RSSI (dBm)', data:ev.map(e=>+e.rssi||0),
+          backgroundColor:ev.map(e=>(+e.rssi>=-60?ACCENT:+e.rssi>=-75?WARN:DANGER)) }]},
+      options:{ responsive:true, scales:{ x:{grid:{display:false}}, y:{grid:{color:SEP},title:{display:true,text:'dBm'}} },
+        plugins:{legend:{display:false}, tooltip:{callbacks:{afterLabel:c=>{
+          const e=ev[c.dataIndex]; return 'ch'+e.channel+'  '+e.type+'\nsrc '+e.src; }}}} }
+    }));
+  } else document.getElementById('deauthChart').parentElement.style.display='none';
+
+  // Networks table
+  renderNetTable(nets);
+
+  // Handshake note
+  const hs = document.getElementById('hsNote');
+  hs.style.display='block';
+  hs.innerHTML = 'Handshake captures live separately in <code>packmon-hs/sNNNN.pcap</code> on the card. '+
+    'Open them with Wireshark, or convert to a hashcat 22000 file with '+
+    '<code>hcxpcapngtool -o hs.22000 sNNNN.pcap</code>.';
+}
+
+function radarOpts(){
+  return { responsive:true, scales:{ r:{
+    angleLines:{color:SEP}, grid:{color:SEP}, pointLabels:{color:LABEL,font:{size:10}},
+    ticks:{display:false, backdropColor:'transparent'}, suggestedMin:0 }},
+    plugins:{legend:{display:false}} };
+}
+
+let sortKey='rssi', sortDir=-1;
+function renderNetTable(nets){
+  const thead = document.querySelector('#netTable thead');
+  const tbody = document.querySelector('#netTable tbody');
+  const cols = [['ssid','SSID'],['bssid','BSSID'],['channel','CH'],['rssi','RSSI'],['security','SEC'],['time','FIRST SEEN']];
+  thead.innerHTML = '<tr>'+cols.map(c=>`<th data-k="${c[0]}">${c[1]}</th>`).join('')+'</tr>';
+  thead.querySelectorAll('th').forEach(th=>th.onclick=()=>{
+    const k=th.dataset.k; sortDir = (k===sortKey)?-sortDir:-1; sortKey=k; renderNetTable(nets);
+  });
+  const rows = [...nets].sort((a,b)=>{
+    let x=a[sortKey], y=b[sortKey];
+    if(sortKey==='rssi'||sortKey==='channel'){ x=+x; y=+y; }
+    return (x<y?-1:x>y?1:0)*sortDir;
+  });
+  tbody.innerHTML = rows.map(n=>`<tr>
+    <td>${esc(n.ssid)||'<span class="mac">&lt;hidden&gt;</span>'}</td>
+    <td class="mac">${n.bssid}</td>
+    <td>${n.channel}</td>
+    <td style="color:${+n.rssi>=-60?ACCENT:+n.rssi>=-75?WARN:DANGER}">${n.rssi}</td>
+    <td class="${n.security==='enc'?'enc':'open'}">${n.security}</td>
+    <td class="mac">${n.time}</td></tr>`).join('');
+}
+function esc(s){ return (s||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+
+// ── Wiring ─────────────────────────────────────────────────────────────────
+const drop = document.getElementById('drop');
+document.getElementById('pick').onclick = e=>{ e.stopPropagation(); document.getElementById('file').click(); };
+drop.onclick = ()=>document.getElementById('file').click();
+document.getElementById('file').onchange = e=>readFiles(e.target.files);
+['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over');}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over');}));
+drop.addEventListener('drop',e=>readFiles(e.dataTransfer.files));
+
+// ── Demo data ──────────────────────────────────────────────────────────────
+document.getElementById('demo').onclick = e=>{
+  e.stopPropagation();
+  const chans=[1,6,11], nets=[];
+  let netCsv='time,bssid,ssid,channel,rssi,security\n';
+  const names=['HomeNet','office-5G','FreeWiFi','','NETGEAR47','Livebox-A2','coffee_guest','IoT-hub'];
+  for(let i=0;i<8;i++){
+    const ch=[1,6,11,3,6,11,1,9][i], r=-40-Math.floor(Math.random()*45);
+    netCsv+=`00:0${i}:0${i}:0${i}:0${i}:0${i},${i%4===3?'':names[i]},${ch},${r},${i%3?'enc':'open'}\n`;
+  }
+  let evCsv='time,type,channel,rssi,src,dst\n';
+  for(let i=0;i<14;i++){
+    const s=120+i*17, hh=String(Math.floor(s/3600)).padStart(2,'0'),
+      mm=String(Math.floor(s/60)%60).padStart(2,'0'), ss=String(s%60).padStart(2,'0');
+    evCsv+=`${hh}:${mm}:${ss}.000,${i%5===0?'disassoc':'deauth'},${[6,11,1,6][i%4]},${-45-Math.floor(Math.random()*40)},DE:AD:BE:EF:00:0${i%9},FF:FF:FF:FF:FF:FF\n`;
+  }
+  let stCsv='time,total,mgmt,ctrl,data,beacon,deauth,rate';
+  for(let c=1;c<=13;c++) stCsv+=',ch'+c; stCsv+='\n';
+  let tot=0,mg=0,ct=0,da=0,be=0,de=0; const ch=[0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+  for(let k=0;k<40;k++){
+    const rate=200+Math.round(120*Math.sin(k/4)+Math.random()*80);
+    tot+=rate; mg+=Math.round(rate*.35); ct+=Math.round(rate*.15); da+=Math.round(rate*.5);
+    be+=Math.round(rate*.2); if(k%9===3) de+=2;
+    [1,6,11].forEach(c=>ch[c]+=Math.round(rate*(c===6?.5:c===1?.3:.2)));
+    const s=100+k*5, hh=String(Math.floor(s/3600)).padStart(2,'0'),
+      mm=String(Math.floor(s/60)%60).padStart(2,'0'), ss=String(s%60).padStart(2,'0');
+    stCsv+=`${hh}:${mm}:${ss}.000,${tot},${mg},${ct},${da},${be},${de},${rate}`;
+    for(let c=1;c<=13;c++) stCsv+=','+ch[c];
+    stCsv+='\n';
+  }
+  ingest('demo-networks.csv',netCsv);
+  ingest('demo-events.csv',evCsv);
+  ingest('demo-stats.csv',stCsv);
+  done(['events','networks','stats']);
+};
+</script>
+</body>
+</html>

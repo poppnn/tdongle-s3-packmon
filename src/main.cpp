@@ -3,6 +3,8 @@
 #include "esp_wifi.h"
 #include <Arduino_GFX_Library.h>
 #include <FastLED.h>
+#include <FS.h>
+#include <SD_MMC.h>
 #include <stdarg.h>
 
 // ─── Pin config (official LilyGO T-Dongle S3) ─────────────────────────────
@@ -15,6 +17,11 @@
 #define PIN_LED_DATA  40
 #define PIN_LED_CLK   39
 #define PIN_BTN   0
+
+// microSD in 1-bit SD_MMC mode (official T-Dongle S3 wiring)
+#define PIN_SD_CLK  12
+#define PIN_SD_CMD  16
+#define PIN_SD_D0   14
 
 #define SCR_W 160
 #define SCR_H 80
@@ -79,10 +86,34 @@ typedef struct {
 
 // ─── Counters (written by the sniffer task, read by the UI) ────────────────
 volatile uint32_t s_total = 0, s_mgmt = 0, s_ctrl = 0, s_data = 0;
-volatile uint32_t s_beacon = 0, s_deauth = 0;
+volatile uint32_t s_beacon = 0, s_deauth = 0, s_eapol = 0;
 volatile uint32_t s_ch[MAX_CHANNELS + 1] = {0};
 volatile int8_t   s_rssi = 0;
 volatile uint32_t ev_dropped = 0;
+
+// ─── Handshake capture ─────────────────────────────────────────────────────
+// The WiFi callback cannot touch the SD card, so EAPOL frames (and one
+// beacon per network, to name the SSID) are copied whole into this ring and
+// written to a .pcap from loop(). Enabled only when a card mounted at boot.
+#define HS_RING    24
+#define HS_MAXLEN  256
+typedef struct {
+    uint16_t len;
+    uint8_t  data[HS_MAXLEN];
+} rawframe_t;
+static rawframe_t hs_ring[HS_RING];
+static volatile uint16_t hs_head = 0, hs_tail = 0;
+volatile uint32_t hs_dropped = 0;
+volatile uint32_t hs_saved   = 0;    // frames written to the pcap
+
+// BSSIDs we have seen EAPOL from, so the next matching beacon is captured
+// once to give the handshake a readable network name.
+#define HS_TRACK 12
+static uint8_t hs_bssid[HS_TRACK][6];
+static bool    hs_beaconed[HS_TRACK] = {false};
+static int     hs_track_n = 0;
+
+static bool sd_ok = false;   // decided once, during the boot splash
 
 // ─── Event queue ───────────────────────────────────────────────────────────
 // The promiscuous callback stays short: it bumps counters and hands richer
@@ -97,6 +128,7 @@ typedef struct {
     uint8_t  channel;
     int8_t   rssi;
     uint8_t  ssid_len;
+    uint8_t  sub;        // mgmt subtype (deauth vs disassoc)
     uint16_t caps;
     uint8_t  bssid[6];
     uint8_t  dst[6];
@@ -236,6 +268,156 @@ static uint16_t rssi_color(int8_t r) {
     return C_DANGER;
 }
 
+// ─── SD logging ────────────────────────────────────────────────────────────
+// Three plain CSV files per session under /packmon-logs, plus one .pcap of
+// captured handshakes under /packmon-hs. CSV is chosen so the raw files are
+// readable in any text editor or spreadsheet; the bundled viewer turns them
+// into charts. Files are kept open for the whole session and flushed on a
+// timer, so no line is lost to a yank but the card is not hammered per write.
+static int  log_session = 0;
+static File f_events, f_nets, f_stats, f_hs;
+static bool log_dirty = false;
+
+// Uptime as HH:MM:SS.mmm — there is no RTC, so every timestamp is relative to
+// power-on. Human-legible and still sortable.
+static void log_stamp(char *b, size_t n, uint32_t ms) {
+    uint32_t s = ms / 1000, msr = ms % 1000;
+    snprintf(b, n, "%02u:%02u:%02u.%03u", s / 3600, (s / 60) % 60, s % 60, msr);
+}
+
+static void log_csv_ssid(File &f, const char *ssid) {
+    // Keep SSIDs from breaking the CSV: drop commas, quotes and control bytes.
+    if (!ssid || !ssid[0]) { f.print("<hidden>"); return; }
+    for (const char *p = ssid; *p; p++) {
+        char c = *p;
+        if (c == ',' || c == '"' || c < 0x20) c = ' ';
+        f.write((uint8_t)c);
+    }
+}
+
+static void log_event(const uint8_t *src, const uint8_t *dst, uint8_t sub,
+                      uint8_t ch, int8_t rssi) {
+    if (!sd_ok || !f_events) return;
+    char ts[16]; log_stamp(ts, sizeof(ts), millis());
+    f_events.printf("%s,%s,%u,%d,%02X:%02X:%02X:%02X:%02X:%02X,"
+                    "%02X:%02X:%02X:%02X:%02X:%02X\n",
+                    ts, sub == SUB_DEAUTH ? "deauth" : "disassoc", ch, rssi,
+                    src[0], src[1], src[2], src[3], src[4], src[5],
+                    dst[0], dst[1], dst[2], dst[3], dst[4], dst[5]);
+    log_dirty = true;
+}
+
+static void log_network(const ap_t *a) {
+    if (!sd_ok || !f_nets) return;
+    char ts[16]; log_stamp(ts, sizeof(ts), millis());
+    f_nets.printf("%s,%02X:%02X:%02X:%02X:%02X:%02X,",
+                  ts, a->bssid[0], a->bssid[1], a->bssid[2],
+                  a->bssid[3], a->bssid[4], a->bssid[5]);
+    log_csv_ssid(f_nets, a->ssid);
+    f_nets.printf(",%u,%d,%s\n", a->channel, a->rssi, a->enc ? "enc" : "open");
+    log_dirty = true;
+}
+
+static void log_stats(uint32_t rate) {
+    if (!sd_ok || !f_stats) return;
+    char ts[16]; log_stamp(ts, sizeof(ts), millis());
+    f_stats.printf("%s,%u,%u,%u,%u,%u,%u,%u",
+                   ts, s_total, s_mgmt, s_ctrl, s_data, s_beacon, s_deauth, rate);
+    for (int c = 1; c <= MAX_CHANNELS; c++) f_stats.printf(",%u", s_ch[c]);
+    f_stats.print("\n");
+    log_dirty = true;
+}
+
+static void log_flush() {
+    if (!sd_ok || !log_dirty) return;
+    if (f_events) f_events.flush();
+    if (f_nets)   f_nets.flush();
+    if (f_stats)  f_stats.flush();
+    if (f_hs)     f_hs.flush();
+    log_dirty = false;
+}
+
+static void pcap_u32(File &f, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    f.write(b, 4);
+}
+static void pcap_u16(File &f, uint16_t v) {
+    uint8_t b[2] = { (uint8_t)v, (uint8_t)(v >> 8) };
+    f.write(b, 2);
+}
+
+// Standard libpcap global header, link type 105 = IEEE 802.11.
+static void pcap_write_header(File &f) {
+    pcap_u32(f, 0xa1b2c3d4);
+    pcap_u16(f, 2); pcap_u16(f, 4);
+    pcap_u32(f, 0); pcap_u32(f, 0);
+    pcap_u32(f, 65535);
+    pcap_u32(f, 105);
+}
+
+// Drain captured EAPOL/beacon frames to the pcap. Runs in loop().
+static void hs_drain() {
+    if (!sd_ok || !f_hs) return;
+    while (hs_tail != hs_head) {
+        rawframe_t *r = &hs_ring[hs_tail];
+        uint32_t ms = millis();
+        pcap_u32(f_hs, ms / 1000);
+        pcap_u32(f_hs, (ms % 1000) * 1000);
+        pcap_u32(f_hs, r->len);
+        pcap_u32(f_hs, r->len);
+        f_hs.write(r->data, r->len);
+        hs_saved++;
+        log_dirty = true;
+        hs_tail = (uint16_t)((hs_tail + 1) % HS_RING);
+    }
+}
+
+static int sd_next_session() {
+    int n = 1;
+    File r = SD_MMC.open("/packmon-logs/session.txt", FILE_READ);
+    if (r) { n = r.parseInt() + 1; r.close(); }
+    if (n < 1) n = 1;
+    File w = SD_MMC.open("/packmon-logs/session.txt", FILE_WRITE);
+    if (w) { w.printf("%d", n); w.close(); }
+    return n;
+}
+
+// Mount the card and open this session's files. Called once from the splash;
+// everything logging-related keys off the sd_ok it returns.
+static bool sd_init() {
+    SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0);
+    if (!SD_MMC.begin("/sdcard", true, false, 20000)) return false;   // 1-bit
+    if (SD_MMC.cardType() == CARD_NONE) { SD_MMC.end(); return false; }
+
+    SD_MMC.mkdir("/packmon-logs");
+    SD_MMC.mkdir("/packmon-hs");
+    log_session = sd_next_session();
+
+    char path[40];
+    snprintf(path, sizeof(path), "/packmon-logs/s%04d-events.csv", log_session);
+    f_events = SD_MMC.open(path, FILE_WRITE);
+    if (f_events) f_events.print("time,type,channel,rssi,src,dst\n");
+
+    snprintf(path, sizeof(path), "/packmon-logs/s%04d-networks.csv", log_session);
+    f_nets = SD_MMC.open(path, FILE_WRITE);
+    if (f_nets) f_nets.print("time,bssid,ssid,channel,rssi,security\n");
+
+    snprintf(path, sizeof(path), "/packmon-logs/s%04d-stats.csv", log_session);
+    f_stats = SD_MMC.open(path, FILE_WRITE);
+    if (f_stats) {
+        f_stats.print("time,total,mgmt,ctrl,data,beacon,deauth,rate");
+        for (int c = 1; c <= MAX_CHANNELS; c++) f_stats.printf(",ch%d", c);
+        f_stats.print("\n");
+    }
+
+    snprintf(path, sizeof(path), "/packmon-hs/s%04d.pcap", log_session);
+    f_hs = SD_MMC.open(path, FILE_WRITE);
+    if (f_hs) pcap_write_header(f_hs);
+
+    log_dirty = true;
+    return f_events && f_stats;
+}
+
 // ─── Text helpers ──────────────────────────────────────────────────────────
 static void txt(int x, int y, uint16_t color, uint8_t size, const char *fmt, ...) {
     char b[64];
@@ -304,7 +486,46 @@ void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     uint8_t  sub = FC_SUBTYPE(fc);
 
     if (ft == TYPE_CTRL) { s_ctrl++; return; }
-    if (ft == TYPE_DATA) { s_data++; return; }
+
+    if (ft == TYPE_DATA) {
+        s_data++;
+        // EAPOL detection for handshake capture. The 4-way handshake travels
+        // in the clear as data frames carrying an LLC/SNAP header with
+        // ethertype 0x888E, so it is visible even on WPA2 networks.
+        if (sd_ok) {
+            int hdr = 24;
+            if (sub & 0x08) hdr += 2;                        // QoS data: +2
+            if (((fc >> 8) & 1) && ((fc >> 9) & 1)) hdr += 6; // 4-addr WDS
+            if (len >= hdr + 8) {
+                const uint8_t *l = pkt->payload + hdr;
+                if (l[0] == 0xAA && l[1] == 0xAA && l[2] == 0x03 &&
+                    l[6] == 0x88 && l[7] == 0x8E) {
+                    s_eapol++;
+                    // BSSID is addr2 when FromDS, else addr1.
+                    const uint8_t *bssid = ((fc >> 9) & 1) ? h->addr2 : h->addr1;
+                    int slot = -1;
+                    for (int i = 0; i < hs_track_n; i++)
+                        if (memcmp(hs_bssid[i], bssid, 6) == 0) { slot = i; break; }
+                    if (slot < 0 && hs_track_n < HS_TRACK) {
+                        slot = hs_track_n++;
+                        memcpy(hs_bssid[slot], bssid, 6);
+                        hs_beaconed[slot] = false;
+                    }
+                    // Copy the EAPOL frame into the pcap ring.
+                    uint16_t nh = (uint16_t)((hs_head + 1) % HS_RING);
+                    if (nh == hs_tail) { hs_dropped++; }
+                    else {
+                        int n = len > HS_MAXLEN ? HS_MAXLEN : len;
+                        hs_ring[hs_head].len = n;
+                        memcpy(hs_ring[hs_head].data, pkt->payload, n);
+                        hs_head = nh;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if (ft != TYPE_MGMT) return;
 
     s_mgmt++;
@@ -337,6 +558,23 @@ void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
             }
         }
         ev_push(&e);
+
+        // If this network owes the handshake pcap a beacon, grab this one.
+        if (sd_ok) {
+            for (int i = 0; i < hs_track_n; i++) {
+                if (!hs_beaconed[i] && memcmp(hs_bssid[i], h->addr2, 6) == 0) {
+                    uint16_t nh = (uint16_t)((hs_head + 1) % HS_RING);
+                    if (nh != hs_tail) {
+                        int n = len > HS_MAXLEN ? HS_MAXLEN : len;
+                        hs_ring[hs_head].len = n;
+                        memcpy(hs_ring[hs_head].data, pkt->payload, n);
+                        hs_head = nh;
+                        hs_beaconed[i] = true;
+                    }
+                    break;
+                }
+            }
+        }
         return;
     }
 
@@ -345,6 +583,7 @@ void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
         evt_t e;
         memset(&e, 0, sizeof(e));
         e.kind    = EV_DEAUTH;
+        e.sub     = sub;
         e.rssi    = rx->rssi;
         e.channel = current_channel;
         memcpy(e.bssid, h->addr2, 6);
@@ -392,6 +631,7 @@ static void ap_update(const evt_t *e) {
     aps[slot].enc       = (e->caps & 0x0010) != 0;
     aps[slot].last_seen = millis();
     aps[slot].frames    = 1;
+    log_network(&aps[slot]);
 }
 
 static void threat_add(const evt_t *e) {
@@ -410,6 +650,8 @@ static void threat_add(const evt_t *e) {
     alert_ch   = e->channel;
     alert_rssi = e->rssi;
     memcpy(alert_src, e->bssid, 6);
+
+    log_event(t->src, t->dst, e->sub, t->channel, t->rssi);
 
     Serial.printf("[DEAUTH] #%u  src=%s  dst=%s  ch=%d  rssi=%d dBm\n",
                   s_deauth, mac2str(t->src).c_str(), mac2str(t->dst).c_str(),
@@ -683,7 +925,7 @@ static void page_system(int ox) {
     draw_header(ox, PAGE_NAME[PAGE_SYSTEM]);
 
     char v[20];
-    const int y0 = 15, rh = 10;
+    const int y0 = 14, rh = 9;
     int r = 0;
 
     fmt_uptime(v, sizeof(v), millis() - boot_ms);
@@ -703,11 +945,17 @@ static void page_system(int ox) {
     txt(ox + 4, y0 + r * rh, C_LABEL, 1, "MGMT/DATA");
     txt_r(ox + SCR_W - 4, y0 + r * rh, C_TEXT, 1, "%s/%s", m, d); r++;
 
-    txt(ox + 4, y0 + r * rh, C_LABEL, 1, "FREE RAM");
-    txt_r(ox + SCR_W - 4, y0 + r * rh, C_TEXT, 1, "%uK", ESP.getFreeHeap() / 1024); r++;
+    txt(ox + 4, y0 + r * rh, C_LABEL, 1, "EAPOL/HS");
+    txt_r(ox + SCR_W - 4, y0 + r * rh, s_eapol ? C_ACCENT : C_TEXT, 1,
+          "%u/%u", s_eapol, hs_saved); r++;
 
-    txt(ox + 4, y0 + r * rh, C_LABEL, 1, "FPS");
-    txt_r(ox + SCR_W - 4, y0 + r * rh, fps >= 24 ? C_OK : C_WARN, 1, "%u", fps);
+    txt(ox + 4, y0 + r * rh, C_LABEL, 1, "LOG");
+    if (sd_ok) txt_r(ox + SCR_W - 4, y0 + r * rh, C_ACCENT, 1, "SD s%04d", log_session);
+    else       txt_r(ox + SCR_W - 4, y0 + r * rh, C_SEP, 1, "off"); r++;
+
+    txt(ox + 4, y0 + r * rh, C_LABEL, 1, "RAM/FPS");
+    txt_r(ox + SCR_W - 4, y0 + r * rh, fps >= 24 ? C_OK : C_WARN, 1,
+          "%uK %uf", ESP.getFreeHeap() / 1024, fps);
 }
 
 // ─── Deauth alert overlay ──────────────────────────────────────────────────
@@ -782,8 +1030,21 @@ static void splash_screen() {
     const int cw = 12, total = 5 * cw;
     const int sx = (SCR_W - total) / 2;
 
+    bool sd_done = false;
+    char sd_line[26] = {0};
+
     for (int f = 0; f <= 72; f++) {
         float t = (float)f / 72.0f;
+
+        // Look for a card while the bar fills — logging is armed for the whole
+        // run based on what is present now, at boot, and nothing later.
+        if (!sd_done && f >= 30) {
+            sd_done = true;
+            sd_ok = sd_init();
+            if (sd_ok) snprintf(sd_line, sizeof(sd_line), "SD OK  logging s%04d", log_session);
+            else       snprintf(sd_line, sizeof(sd_line), "no SD  logging off");
+        }
+
         gfx->fillScreen(C_BG);
 
         // Letters fade up one after another.
@@ -805,8 +1066,14 @@ static void splash_screen() {
 
         float s = clampf((t - 0.5f) / 0.25f, 0.0f, 1.0f);
         if (s > 0) txt_c(SCR_W / 2, 50, lerp565(C_BG, C_LABEL, s), 1, "WiFi Packet Monitor");
-        float v = clampf((t - 0.62f) / 0.25f, 0.0f, 1.0f);
-        if (v > 0) txt_c(SCR_W / 2, 61, lerp565(C_BG, C_SEP, v), 1, "T-Dongle S3  v4");
+
+        // Once the card is probed, its verdict replaces the version line.
+        if (sd_done) {
+            txt_c(SCR_W / 2, 61, sd_ok ? C_ACCENT : C_SEP, 1, sd_line);
+        } else {
+            float v = clampf((t - 0.62f) / 0.25f, 0.0f, 1.0f);
+            if (v > 0) txt_c(SCR_W / 2, 61, lerp565(C_BG, C_SEP, v), 1, "T-Dongle S3  v5");
+        }
 
         // Loading bar, one green shade per pixel.
         float l = clampf((t - 0.45f) / 0.5f, 0.0f, 1.0f);
@@ -822,7 +1089,7 @@ static void splash_screen() {
         led_set(0, br, (uint8_t)(br * 0.8f));
         delay(14);
     }
-    delay(250);
+    delay(450);
 }
 
 // ─── WiFi ──────────────────────────────────────────────────────────────────
@@ -838,7 +1105,7 @@ static void wifi_sniffer_init() {
 }
 
 static void reset_stats() {
-    s_total = s_mgmt = s_ctrl = s_data = s_beacon = s_deauth = 0;
+    s_total = s_mgmt = s_ctrl = s_data = s_beacon = s_deauth = s_eapol = 0;
     for (int c = 0; c <= MAX_CHANNELS; c++) { s_ch[c] = 0; ch_recent[c] = 0; ch_bar[c] = 0; }
     memset(graph, 0, sizeof(graph));
     memset(aps, 0, sizeof(aps));
@@ -926,6 +1193,15 @@ void loop() {
         rate_window_ts = now;
     }
 
+    // Move captured handshake frames onto the card, log a stats row every 5 s,
+    // and flush all open files every 3 s. All SD access lives here in loop().
+    if (sd_ok) {
+        hs_drain();
+        static uint32_t last_stat_log = 0, last_flush = 0;
+        if (now - last_stat_log >= 5000) { last_stat_log = now; log_stats(last_rate); }
+        if (now - last_flush >= 3000)    { last_flush = now; log_flush(); }
+    }
+
     // Per-channel activity decays so the bars show recent load, not history
     if (now - last_decay >= 500) {
         last_decay = now;
@@ -979,9 +1255,10 @@ void loop() {
     if (now - last_beat >= 10000) {
         last_beat = now;
         Serial.printf("[stat] pkts=%u (mgmt=%u ctrl=%u data=%u beacon=%u) deauth=%u "
-                      "aps=%u rate=%u/s ch=%d%s dropped=%u heap=%u\n",
+                      "aps=%u rate=%u/s ch=%d%s eapol=%u hs=%u sd=%s dropped=%u heap=%u\n",
                       s_total, s_mgmt, s_ctrl, s_data, s_beacon, s_deauth,
                       ap_active(), last_rate, current_channel, ch_lock ? " LOCK" : "",
+                      s_eapol, hs_saved, sd_ok ? "on" : "off",
                       ev_dropped, ESP.getFreeHeap());
     }
 

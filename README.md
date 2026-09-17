@@ -18,6 +18,9 @@ attacker's MAC, channel and RSSI the moment it sees a deauth or disassoc frame.
 - Beacon parsing builds a live table of nearby networks (SSID, channel, encryption, RSSI)
 - Per-channel activity bars so you can see which channel the noise is on
 - Channel lock to stop hopping and stare at one channel
+- **SD logging** — readable CSV logs per session, enabled automatically when a card is present at boot
+- **Handshake capture** — EAPOL frames saved as standard `.pcap` for Wireshark / hashcat
+- **[Browser log viewer](https://poppnn.github.io/tdongle-s3-packmon/viewer.html)** — turns the CSVs into spider charts and timelines
 - APA102 status LED shifts colour with traffic load, red strobe under attack
 - Rendered through a framebuffer at ~30 fps: no flicker, animated transitions throughout
 
@@ -62,6 +65,9 @@ ST7735 0.96" display, APA102 RGB LED and a microSD slot.
 | LED data | 40 |
 | LED clock | 39 |
 | Button | 0 |
+| SD CLK | 12 |
+| SD CMD | 16 |
+| SD D0 | 14 |
 
 ## Flashing
 
@@ -112,6 +118,59 @@ bar showing when it will hand the page back. It then slides onto **THREATS** rat
 to the page you were on, so the overlay gives you the headline — how strong the attacker is, right
 now — and the page you land on gives the history behind it. Button taps are ignored while the
 overlay is up.
+
+## SD-card logging
+
+Logging is **opt-in by hardware**: on boot, during the splash, packmon probes for a microSD card
+(SD_MMC, 1-bit: CLK 12, CMD 16, D0 14). If one is present it logs the whole session; if not, it
+runs exactly as before and never touches the card again. The splash shows `SD OK  logging sNNNN`
+or `no SD  logging off`, and the SYSTEM page shows the state live.
+
+When a card is found, two folders are created at the card root:
+
+### `packmon-logs/` — readable CSV
+
+One set of files per session (`sNNNN`, an incrementing counter kept in `session.txt`). Timestamps
+are `HH:MM:SS.mmm` from power-on — there is no RTC.
+
+| File | One row per | Columns |
+|---|---|---|
+| `sNNNN-events.csv` | deauth / disassoc frame | `time, type, channel, rssi, src, dst` |
+| `sNNNN-networks.csv` | network first seen | `time, bssid, ssid, channel, rssi, security` |
+| `sNNNN-stats.csv` | 5-second snapshot | `time, total, mgmt, ctrl, data, beacon, deauth, rate, ch1..ch13` |
+
+Files are kept open for the session and flushed every 3 s, so a yanked card loses at most the last
+few seconds. SSIDs are sanitised (commas, quotes and control bytes stripped) so the CSV never breaks.
+
+### `packmon-hs/` — handshake captures
+
+EAPOL frames from WPA/WPA2 four-way handshakes travel in the clear as data frames, so they are
+visible in monitor mode. Each one is written to `sNNNN.pcap` (libpcap, link type 105 = IEEE 802.11),
+along with one beacon per network so the capture carries the SSID. Open it in Wireshark, or convert
+it for cracking:
+
+```bash
+hcxpcapngtool -o handshake.22000 sNNNN.pcap
+hashcat -m 22000 handshake.22000 wordlist.txt
+```
+
+Capture is best-effort: channel hopping means you only catch a handshake if the dongle is on that
+network's channel when a device (re)connects — **lock the channel** (hold the button) on the target
+to raise your odds. This is receive-only; packmon never sends deauth frames to force a reconnect.
+
+## Log viewer
+
+`docs/viewer.html` (live at **<https://poppnn.github.io/tdongle-s3-packmon/viewer.html>**) is a
+single self-contained page — drop a session's CSV files onto it and it renders, entirely in your
+browser with nothing uploaded:
+
+- a **spider / radar chart** of per-channel activity (the "toile d'araignée")
+- a second radar of the frame-type mix (mgmt / ctrl / data / beacon / deauth)
+- a traffic timeline (packets/s and cumulative deauth on a dual axis)
+- a deauth-event bar chart coloured by signal strength
+- a sortable table of every network seen
+
+There is a **Load demo data** button to see the layout without a card.
 
 ## Rebuilding the web flasher image
 
