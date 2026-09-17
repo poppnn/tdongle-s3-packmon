@@ -191,6 +191,12 @@ hcxpcapngtool -o handshake.22000 capture.pcapng
 hashcat -m 22000 handshake.22000 wordlist.txt
 ```
 
+> **Only WPA/WPA2/WPA3-Personal (PSK) can be cracked.** Enterprise networks (WPA-Enterprise / 802.1X,
+> e.g. university, corporate or `eduroam`-style SSIDs, which show up as EAP / PEAP / IDENTITIES in
+> hcxpcapngtool) derive a per-session key from a RADIUS login — there is no shared passphrase to
+> recover, so `hashcat -m 22000` will find nothing no matter how clean the capture. Aim at a home
+> router with a WiFi password.
+
 Capture is best-effort: channel hopping means you only catch a handshake if the dongle is on that
 network's channel when a device (re)connects — **lock the channel** (hold the button, or `channel N`
 over serial) on the target to raise your odds. If hcx still reports too few M1/handshake frames, it

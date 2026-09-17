@@ -114,7 +114,7 @@ volatile uint32_t ev_dropped = 0;
 // beacon per network, to name the SSID) are copied whole into this ring and
 // written to a .pcapng from loop(). Enabled only when a card mounted at boot.
 #define HS_RING    32
-#define HS_MAXLEN  300
+#define HS_MAXLEN  512   // covers full beacons/assoc so IEs aren't truncated
 typedef struct {
     uint16_t len;
     int8_t   rssi;
@@ -675,10 +675,13 @@ static inline void cap_push(const uint8_t *frame, int len, int8_t rssi, uint8_t 
 }
 
 // True for the management frames worth keeping for handshake / PSK recovery.
+// Deauth/disassoc are deliberately excluded: they are logged to events.csv and
+// the threats page, and flooding the pcapng with them only bloats the file and
+// makes hcxpcapngtool warn that they may have reset the AP's nonces.
 static inline bool cap_want_mgmt(uint8_t sub) {
     return sub == SUB_AUTH || sub == SUB_ASSOC_REQ || sub == SUB_ASSOC_RESP ||
            sub == SUB_REASSOC_REQ || sub == SUB_REASSOC_RESP ||
-           sub == SUB_PROBE_REQ || sub == SUB_DEAUTH || sub == SUB_DISASSOC;
+           sub == SUB_PROBE_REQ;
 }
 
 void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
