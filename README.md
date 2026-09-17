@@ -159,28 +159,37 @@ the runs stay separable even though timestamps (`HH:MM:SS.mmm`) restart at zero 
 | `events.csv` | deauth / disassoc frame | `session, time, type, channel, rssi, src, dst` |
 | `networks.csv` | network first seen | `session, time, bssid, ssid, channel, rssi, security` |
 | `stats.csv` | 5-second snapshot | `session, time, total, mgmt, ctrl, data, beacon, deauth, rate, ch1..ch13` |
-| `capture.pcap` | captured 802.11 frame | libpcap (link type 105), handshakes + a beacon per network |
+| `capture.pcapng` | captured 802.11 frame | pcapng + radiotap; EAPOL, auth/assoc and one beacon per network |
 
 The CSVs are kept open for the session and flushed every 3 s, so a yanked card loses at most the last
 few seconds. SSIDs are sanitised (commas, quotes and control bytes stripped) so the CSV never breaks.
 Because the stats counters are cumulative *within* a boot and reset on the next, the viewer sums each
 session's final row rather than reading the last line of the file.
 
-### `capture.pcap` — handshake captures
+### `capture.pcapng` — handshake captures
 
-EAPOL frames from WPA/WPA2 four-way handshakes travel in the clear as data frames, so they are
-visible in monitor mode. Each one is appended to `capture.pcap` (libpcap, link type 105 = IEEE
-802.11), along with one beacon per network so the capture carries the SSID. Open it in Wireshark, or
-convert it for cracking:
+Frames are written as **pcapng** with a **radiotap** header (channel + signal per frame) and proper
+64-bit microsecond timestamps — the format `hcxpcapngtool` and Wireshark expect. What gets captured:
+
+- **EAPOL** frames of the WPA/WPA2 four-way handshake (they travel in the clear as data frames)
+- **authentication, (re)association and probe** frames — these carry the RSN/PMKID info hcx needs to
+  recover the PSK and to compute nonce-error-correction
+- **one beacon per network** to name the ESSID
+
+ESP32 monitor frames include the 4-byte FCS, so the radiotap header flags it (`FCS at end`) to avoid
+"malformed packet" noise. Convert and crack:
 
 ```bash
-hcxpcapngtool -o handshake.22000 capture.pcap
+hcxpcapngtool -o handshake.22000 capture.pcapng
 hashcat -m 22000 handshake.22000 wordlist.txt
 ```
 
 Capture is best-effort: channel hopping means you only catch a handshake if the dongle is on that
-network's channel when a device (re)connects — **lock the channel** (hold the button) on the target
-to raise your odds. This is receive-only; packmon never sends deauth frames to force a reconnect.
+network's channel when a device (re)connects — **lock the channel** (hold the button, or `channel N`
+over serial) on the target to raise your odds. If hcx still reports too few M1/handshake frames, it
+simply means the relevant frames didn't occur on-channel during the capture — lock the channel and
+wait for a client to (re)connect. This is receive-only; packmon never sends deauth frames to force a
+reconnect.
 
 ## USB Mass Storage
 

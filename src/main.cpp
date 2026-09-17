@@ -11,6 +11,7 @@
 #include "USBMSC.h"
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
+#include "esp_timer.h"
 
 // TinyUSB CDC serial (USB_MODE=0, CDC not started on boot). Registered and
 // started manually in setup() so the Mass-Storage interface can be added
@@ -90,10 +91,16 @@ typedef struct {
 #define TYPE_MGMT   0
 #define TYPE_CTRL   1
 #define TYPE_DATA   2
-#define SUB_PROBE_RESP 5
-#define SUB_BEACON     8
-#define SUB_DISASSOC  10
-#define SUB_DEAUTH    12
+#define SUB_ASSOC_REQ    0
+#define SUB_ASSOC_RESP   1
+#define SUB_REASSOC_REQ  2
+#define SUB_REASSOC_RESP 3
+#define SUB_PROBE_REQ    4
+#define SUB_PROBE_RESP   5
+#define SUB_BEACON       8
+#define SUB_DISASSOC    10
+#define SUB_AUTH        11
+#define SUB_DEAUTH      12
 
 // ─── Counters (written by the sniffer task, read by the UI) ────────────────
 volatile uint32_t s_total = 0, s_mgmt = 0, s_ctrl = 0, s_data = 0;
@@ -105,24 +112,28 @@ volatile uint32_t ev_dropped = 0;
 // ─── Handshake capture ─────────────────────────────────────────────────────
 // The WiFi callback cannot touch the SD card, so EAPOL frames (and one
 // beacon per network, to name the SSID) are copied whole into this ring and
-// written to a .pcap from loop(). Enabled only when a card mounted at boot.
-#define HS_RING    24
-#define HS_MAXLEN  256
+// written to a .pcapng from loop(). Enabled only when a card mounted at boot.
+#define HS_RING    32
+#define HS_MAXLEN  300
 typedef struct {
     uint16_t len;
+    int8_t   rssi;
+    uint8_t  channel;
+    uint64_t ts_us;             // capture time, monotonic microseconds
     uint8_t  data[HS_MAXLEN];
 } rawframe_t;
 static rawframe_t hs_ring[HS_RING];
 static volatile uint16_t hs_head = 0, hs_tail = 0;
 volatile uint32_t hs_dropped = 0;
-volatile uint32_t hs_saved   = 0;    // frames written to the pcap
+volatile uint32_t hs_saved   = 0;    // frames written to the capture
 
-// BSSIDs we have seen EAPOL from, so the next matching beacon is captured
-// once to give the handshake a readable network name.
-#define HS_TRACK 12
-static uint8_t hs_bssid[HS_TRACK][6];
-static bool    hs_beaconed[HS_TRACK] = {false};
-static int     hs_track_n = 0;
+// One beacon per BSSID is enough to name a network, so beacons/probe-responses
+// are de-duplicated; everything else useful (auth, assoc, EAPOL) is captured
+// as it arrives.
+#define CAP_BSSIDS 32
+static uint8_t cap_bssid[CAP_BSSIDS][6];
+static int     cap_bssid_n = 0;
+static uint64_t ts_base = 0;         // per-session offset for monotonic ts
 
 static bool sd_ok = false;   // decided once, during the boot splash
 
@@ -292,7 +303,7 @@ static uint16_t rssi_color(int8_t r) {
 
 // ─── SD logging ────────────────────────────────────────────────────────────
 // All under /packmon-logs, with fixed names appended to across boots:
-// events.csv, networks.csv, stats.csv and capture.pcap. Each row carries a
+// events.csv, networks.csv, stats.csv and capture.pcapng. Each row carries a
 // `session` number so the combined data stays separable. CSV is chosen so the
 // raw files are readable in any text editor or spreadsheet; the bundled viewer
 // turns them into charts. Files are kept open for the whole session and
@@ -361,35 +372,80 @@ static void log_flush() {
     log_dirty = false;
 }
 
-static void pcap_u32(File &f, uint32_t v) {
+// ── pcapng writer ──────────────────────────────────────────────────────────
+// pcapng (not classic pcap) so hcxpcapngtool is happy: a Section Header Block
+// and an Interface Description Block once, then an Enhanced Packet Block per
+// frame with a proper 64-bit microsecond timestamp. Link type is RADIOTAP
+// (127); each frame is prefixed with a radiotap header carrying channel and
+// signal, which the plain 802.11 link type could not convey.
+static void pn_u32(File &f, uint32_t v) {
     uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
     f.write(b, 4);
 }
-static void pcap_u16(File &f, uint16_t v) {
-    uint8_t b[2] = { (uint8_t)v, (uint8_t)(v >> 8) };
-    f.write(b, 2);
+
+// LINKTYPE_IEEE802_11_RADIOTAP = 127
+static void pcapng_write_header(File &f) {
+    // Section Header Block
+    pn_u32(f, 0x0A0D0D0A);       // block type
+    pn_u32(f, 28);               // block total length
+    pn_u32(f, 0x1A2B3C4D);       // byte-order magic
+    pn_u32(f, 0x00000001);       // version major=1, minor=0 (LE u16 each)
+    pn_u32(f, 0xFFFFFFFF);       // section length (unknown) low
+    pn_u32(f, 0xFFFFFFFF);       //                          high
+    pn_u32(f, 28);               // block total length
+    // Interface Description Block, with microsecond timestamp resolution
+    pn_u32(f, 0x00000001);       // block type
+    pn_u32(f, 32);               // block total length
+    pn_u32(f, 0x0000007F);       // linktype 127 (low 16) + reserved
+    pn_u32(f, 0);                // snaplen (0 = no limit)
+    // option if_tsresol = 6 (10^-6 s): code 9, len 1, value 6, padded
+    pn_u32(f, 0x00010009);       // opt code 9, opt len 1
+    pn_u32(f, 0x00000006);       // value 6 + 3 pad bytes
+    pn_u32(f, 0x00000000);       // opt endofopt (code 0, len 0)
+    pn_u32(f, 32);               // block total length
 }
 
-// Standard libpcap global header, link type 105 = IEEE 802.11.
-static void pcap_write_header(File &f) {
-    pcap_u32(f, 0xa1b2c3d4);
-    pcap_u16(f, 2); pcap_u16(f, 4);
-    pcap_u32(f, 0); pcap_u32(f, 0);
-    pcap_u32(f, 65535);
-    pcap_u32(f, 105);
+// Radiotap header: present = Flags(bit1) | Channel(bit3) | dBm AntSignal(bit5).
+// ESP32 promiscuous frames include the 4-byte FCS (counted in sig_len), so the
+// Flags field advertises "FCS at end" — otherwise tools treat it as payload
+// and flag every frame malformed. 15 bytes (one pad before the aligned
+// Channel field).
+static int build_radiotap(uint8_t *rt, uint8_t channel, int8_t rssi) {
+    rt[0] = 0; rt[1] = 0;                 // version, pad
+    rt[2] = 15; rt[3] = 0;                // it_len = 15
+    rt[4] = 0x2A; rt[5] = 0; rt[6] = 0; rt[7] = 0;  // it_present: bits 1,3,5
+    rt[8] = 0x10;                         // Flags: FCS present at end
+    rt[9] = 0;                            // pad to 2-byte align for Channel
+    uint16_t freq = 2412 + (channel >= 1 && channel <= 13 ? (channel - 1) * 5 : 0);
+    if (channel == 14) freq = 2484;
+    rt[10] = (uint8_t)freq; rt[11] = (uint8_t)(freq >> 8);   // channel frequency
+    rt[12] = 0xC0; rt[13] = 0x00;         // channel flags: 2GHz + OFDM
+    rt[14] = (uint8_t)rssi;               // dBm antenna signal (signed)
+    return 15;
 }
 
-// Drain captured EAPOL/beacon frames to the pcap. Runs in loop().
+// Drain captured frames to the .pcapng as Enhanced Packet Blocks. In loop().
 static void hs_drain() {
     if (!sd_ok || !f_hs) return;
+    uint8_t rt[16];
     while (hs_tail != hs_head) {
         rawframe_t *r = &hs_ring[hs_tail];
-        uint32_t ms = millis();
-        pcap_u32(f_hs, ms / 1000);
-        pcap_u32(f_hs, (ms % 1000) * 1000);
-        pcap_u32(f_hs, r->len);
-        pcap_u32(f_hs, r->len);
+        int rtlen = build_radiotap(rt, r->channel, r->rssi);
+        uint32_t caplen = rtlen + r->len;
+        uint32_t pad = (4 - (caplen & 3)) & 3;
+        uint32_t total = 32 + caplen + pad;
+        uint64_t ts = r->ts_us;
+        pn_u32(f_hs, 0x00000006);            // EPB type
+        pn_u32(f_hs, total);                 // block total length
+        pn_u32(f_hs, 0);                     // interface id
+        pn_u32(f_hs, (uint32_t)(ts >> 32));  // timestamp high
+        pn_u32(f_hs, (uint32_t)ts);          // timestamp low
+        pn_u32(f_hs, caplen);                // captured length
+        pn_u32(f_hs, caplen);                // original length
+        f_hs.write(rt, rtlen);
         f_hs.write(r->data, r->len);
+        for (uint32_t i = 0; i < pad; i++) f_hs.write((uint8_t)0);
+        pn_u32(f_hs, total);                 // block total length (repeat)
         hs_saved++;
         log_dirty = true;
         hs_tail = (uint16_t)((hs_tail + 1) % HS_RING);
@@ -411,7 +467,7 @@ static int sd_next_session() {
 //
 // Files have fixed names and are opened for APPEND, so every boot adds to the
 // same growing dataset instead of leaving a trail of per-session files. A
-// `session` column (and, for the pcap, simply more packets after the single
+// `session` column (and, for the pcapng, simply more packet blocks after the single
 // global header) keeps the runs separable — the timestamps restart at zero
 // each boot because there is no RTC.
 static bool sd_init() {
@@ -421,6 +477,12 @@ static bool sd_init() {
 
     SD_MMC.mkdir("/packmon-logs");
     log_session = sd_next_session();
+
+    // Per-session timestamp base keeps the appended pcapng monotonically
+    // increasing across boots (esp_timer resets to 0 each boot). One day per
+    // session — a session would have to run 24 h to overlap the next.
+    ts_base = (uint64_t)log_session * 86400ULL * 1000000ULL;
+    cap_bssid_n = 0;
 
     f_events = SD_MMC.open("/packmon-logs/events.csv", FILE_APPEND);
     if (f_events && f_events.size() == 0)
@@ -437,10 +499,10 @@ static bool sd_init() {
         f_stats.print("\n");
     }
 
-    // The pcap global header is written once, when the file is first created;
-    // later boots append their packet records after it.
-    f_hs = SD_MMC.open("/packmon-logs/capture.pcap", FILE_APPEND);
-    if (f_hs && f_hs.size() == 0) pcap_write_header(f_hs);
+    // The pcapng section/interface headers are written once, when the file is
+    // first created; later boots append their packet blocks after them.
+    f_hs = SD_MMC.open("/packmon-logs/capture.pcapng", FILE_APPEND);
+    if (f_hs && f_hs.size() == 0) pcapng_write_header(f_hs);
 
     log_dirty = true;
     return f_events && f_stats;
@@ -569,6 +631,28 @@ static inline void ev_push(const evt_t *e) {
     ev_head = nh;
 }
 
+// Copy a raw 802.11 frame into the capture ring for the .pcapng, tagging it
+// with signal, channel and a monotonic timestamp so hcxpcapngtool can build a
+// proper radiotap header and EAPOL timings.
+static inline void cap_push(const uint8_t *frame, int len, int8_t rssi, uint8_t ch) {
+    uint16_t nh = (uint16_t)((hs_head + 1) % HS_RING);
+    if (nh == hs_tail) { hs_dropped++; return; }
+    int n = len > HS_MAXLEN ? HS_MAXLEN : len;
+    hs_ring[hs_head].len     = n;
+    hs_ring[hs_head].rssi    = rssi;
+    hs_ring[hs_head].channel = ch;
+    hs_ring[hs_head].ts_us   = ts_base + (uint64_t)esp_timer_get_time();
+    memcpy(hs_ring[hs_head].data, frame, n);
+    hs_head = nh;
+}
+
+// True for the management frames worth keeping for handshake / PSK recovery.
+static inline bool cap_want_mgmt(uint8_t sub) {
+    return sub == SUB_AUTH || sub == SUB_ASSOC_REQ || sub == SUB_ASSOC_RESP ||
+           sub == SUB_REASSOC_REQ || sub == SUB_REASSOC_RESP ||
+           sub == SUB_PROBE_REQ || sub == SUB_DEAUTH || sub == SUB_DISASSOC;
+}
+
 void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
     wifi_pkt_rx_ctrl_t *rx = &pkt->rx_ctrl;
@@ -600,25 +684,7 @@ void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
                 if (l[0] == 0xAA && l[1] == 0xAA && l[2] == 0x03 &&
                     l[6] == 0x88 && l[7] == 0x8E) {
                     s_eapol++;
-                    // BSSID is addr2 when FromDS, else addr1.
-                    const uint8_t *bssid = ((fc >> 9) & 1) ? h->addr2 : h->addr1;
-                    int slot = -1;
-                    for (int i = 0; i < hs_track_n; i++)
-                        if (memcmp(hs_bssid[i], bssid, 6) == 0) { slot = i; break; }
-                    if (slot < 0 && hs_track_n < HS_TRACK) {
-                        slot = hs_track_n++;
-                        memcpy(hs_bssid[slot], bssid, 6);
-                        hs_beaconed[slot] = false;
-                    }
-                    // Copy the EAPOL frame into the pcap ring.
-                    uint16_t nh = (uint16_t)((hs_head + 1) % HS_RING);
-                    if (nh == hs_tail) { hs_dropped++; }
-                    else {
-                        int n = len > HS_MAXLEN ? HS_MAXLEN : len;
-                        hs_ring[hs_head].len = n;
-                        memcpy(hs_ring[hs_head].data, pkt->payload, n);
-                        hs_head = nh;
-                    }
+                    cap_push(pkt->payload, len, rx->rssi, current_channel);
                 }
             }
         }
@@ -658,20 +724,15 @@ void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
         }
         ev_push(&e);
 
-        // If this network owes the handshake pcap a beacon, grab this one.
+        // Capture one beacon/probe-response per BSSID — enough to carry the
+        // ESSID for the handshake without flooding the file with beacons.
         if (sd_ok) {
-            for (int i = 0; i < hs_track_n; i++) {
-                if (!hs_beaconed[i] && memcmp(hs_bssid[i], h->addr2, 6) == 0) {
-                    uint16_t nh = (uint16_t)((hs_head + 1) % HS_RING);
-                    if (nh != hs_tail) {
-                        int n = len > HS_MAXLEN ? HS_MAXLEN : len;
-                        hs_ring[hs_head].len = n;
-                        memcpy(hs_ring[hs_head].data, pkt->payload, n);
-                        hs_head = nh;
-                        hs_beaconed[i] = true;
-                    }
-                    break;
-                }
+            bool seen = false;
+            for (int i = 0; i < cap_bssid_n; i++)
+                if (memcmp(cap_bssid[i], h->addr2, 6) == 0) { seen = true; break; }
+            if (!seen && cap_bssid_n < CAP_BSSIDS) {
+                memcpy(cap_bssid[cap_bssid_n++], h->addr2, 6);
+                cap_push(pkt->payload, len, rx->rssi, e.channel);
             }
         }
         return;
@@ -689,6 +750,10 @@ void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
         memcpy(e.dst,   h->addr1, 6);
         ev_push(&e);
     }
+
+    // Auth / (re)assoc / probe-req / deauth frames carry the RSN info and
+    // sequencing hcx needs to recover the PSK — capture them all.
+    if (sd_ok && cap_want_mgmt(sub)) cap_push(pkt->payload, len, rx->rssi, current_channel);
 }
 
 // ─── Table updates (UI task only) ──────────────────────────────────────────

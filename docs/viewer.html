@@ -91,12 +91,12 @@
 
   <div class="drop" id="drop">
     <h2>Drop your packmon files here</h2>
-    <p>the <b>events</b>, <b>networks</b> and <b>stats</b> CSVs <span style="color:var(--sep)">+</span> the <b>.pcap</b> handshake captures — all at once, whole card if you like</p>
+    <p>the <b>events</b>, <b>networks</b> and <b>stats</b> CSVs <span style="color:var(--sep)">+</span> the <b>.pcapng</b> handshake capture — all at once, whole card if you like</p>
     <div class="btnrow">
       <button class="btn" id="pick">Choose files</button>
       <button class="btn ghost" id="demo">Load demo data</button>
     </div>
-    <input type="file" id="file" accept=".csv,.pcap,.cap" multiple hidden>
+    <input type="file" id="file" accept=".csv,.pcap,.pcapng,.cap" multiple hidden>
     <div class="loaded" id="loaded"></div>
   </div>
 
@@ -114,7 +114,7 @@
     <div class="panel" style="margin-bottom:18px;"><h3>Deauth events</h3><canvas id="deauthChart" height="140"></canvas></div>
 
     <div class="panel" id="hsPanel" style="display:none;margin-bottom:18px;">
-      <h3>Handshake captures (.pcap)</h3>
+      <h3>Handshake captures (.pcapng)</h3>
       <div id="hsSummary" style="font-size:12.5px;color:var(--label);margin-bottom:12px;"></div>
       <div style="overflow-x:auto;"><table id="hsTable"><thead></thead><tbody></tbody></table></div>
     </div>
@@ -255,14 +255,50 @@ function parse80211(dv, off, end){
   if(e+16 <= end) p.replay = dv.getUint32(e+13);             // low 32 bits of replay counter
 }
 
-function parsePcap(buf){
-  hs.files++;
+// Hand one packet's link-layer payload to the 802.11 parser, skipping the
+// radiotap header when the link type is 127.
+function feedPacket(buf, dv, fo, pend, linktype){
+  hs.frames++;
+  if(linktype===127){
+    const rtlen = dv.getUint16(fo+2, true);
+    if(rtlen>0 && fo+rtlen < pend) fo += rtlen;
+  }
+  parse80211(new DataView(buf, 0), fo, pend);
+}
+
+// pcapng: Section Header (0x0A0D0D0A) + Interface Description (1) + Enhanced
+// Packet Blocks (6). This is what the firmware writes now.
+function parsePcapng(buf){
   const dv = new DataView(buf);
-  if(dv.byteLength < 24){ hs.badpcap++; return; }
+  const bom = dv.getUint32(8, true);
+  const le = (bom === 0x1a2b3c4d);          // else big-endian
+  let linktype = 127, o = 0;
+  while(o + 12 <= dv.byteLength){
+    const btype = dv.getUint32(o, le);
+    const blen  = dv.getUint32(o + 4, le);
+    if(blen < 12 || o + blen > dv.byteLength) break;
+    if(btype === 0x00000001){                // Interface Description Block
+      linktype = dv.getUint16(o + 8, le);
+    } else if(btype === 0x00000006){         // Enhanced Packet Block
+      const caplen = dv.getUint32(o + 20, le);
+      const po = o + 28;
+      if(po + caplen <= o + blen) feedPacket(buf, dv, po, po + caplen, linktype);
+    } else if(btype === 0x00000003){         // Simple Packet Block
+      const origlen = dv.getUint32(o + 8, le);
+      const po = o + 12;
+      feedPacket(buf, dv, po, Math.min(po + origlen, o + blen - 4), linktype);
+    }
+    o += blen;
+  }
+}
+
+// classic libpcap
+function parsePcapClassic(buf){
+  const dv = new DataView(buf);
   const magic = dv.getUint32(0);   // read big-endian; the value tells us the file's order
   let le;
   if(magic===0xa1b2c3d4 || magic===0xa1b23c4d) le=false;     // bytes a1 b2 c3 d4 -> big-endian file
-  else if(magic===0xd4c3b2a1 || magic===0x4d3cb2a1) le=true; // byte-swapped -> little-endian file (our writer)
+  else if(magic===0xd4c3b2a1 || magic===0x4d3cb2a1) le=true; // byte-swapped -> little-endian file
   else { hs.badpcap++; return; }
   const linktype = dv.getUint32(20, le);
   let o = 24;
@@ -270,16 +306,17 @@ function parsePcap(buf){
     const incl = dv.getUint32(o+8, le);
     o += 16;
     if(incl<=0 || o+incl > dv.byteLength) break;
-    hs.frames++;
-    let fo = o;
-    if(linktype===127){                                      // radiotap: skip it
-      const rtlen = dv.getUint16(fo+2, true);
-      if(rtlen>0 && fo+rtlen < o+incl) fo += rtlen;
-    }
-    // frame bytes are big-endian on the wire; read via a BE-agnostic view
-    parse80211(new DataView(buf, 0), fo, o+incl);
+    feedPacket(buf, dv, o, o+incl, linktype);
     o += incl;
   }
+}
+
+function parsePcap(buf){
+  hs.files++;
+  const dv = new DataView(buf);
+  if(dv.byteLength < 24){ hs.badpcap++; return; }
+  if(dv.getUint32(0) === 0x0a0d0d0a) parsePcapng(buf);   // pcapng section header
+  else parsePcapClassic(buf);
 }
 
 // ── File intake ────────────────────────────────────────────────────────────
@@ -295,7 +332,7 @@ function readFiles(files){
   const finish = k => { if(k) got.push(k); if(--pending===0) done(got); };
   [...files].forEach(f=>{
     const r = new FileReader();
-    if(/\.(pcap|cap)$/i.test(f.name)){
+    if(/\.(pcapng|pcap|cap)$/i.test(f.name)){
       r.onload = () => { try{ parsePcap(r.result); finish('pcap'); }catch(e){ hs.badpcap++; finish(null); } };
       r.readAsArrayBuffer(f);
     } else {
@@ -470,9 +507,9 @@ function render(){
   const note = document.getElementById('hsNote');
   note.style.display='block';
   note.innerHTML = hs.frames
-    ? 'Convert a capture to a hashcat 22000 file with <code>hcxpcapngtool -o hs.22000 sNNNN.pcap</code>, '+
+    ? 'Convert a capture to a hashcat 22000 file with <code>hcxpcapngtool -o hs.22000 capture.pcapng</code>, '+
       'then <code>hashcat -m 22000 hs.22000 wordlist.txt</code>. Only run this against networks you own or are authorised to test.'
-    : 'Drop the <code>packmon-logs/sNNNN.pcap</code> files too and this page will decode the handshakes it caught.';
+    : 'Drop the <code>packmon-logs/capture.pcapng</code> files too and this page will decode the handshakes it caught.';
 }
 
 function renderHandshakes(){
@@ -615,14 +652,30 @@ document.getElementById('demo').onclick = e=>{
 };
 
 // Build a valid little-endian libpcap (linktype 105) in memory for the demo.
+// Build a valid little-endian pcapng (radiotap link type) in memory, matching
+// exactly what the firmware writes, so the demo exercises the real parser.
 function buildDemoPcap(){
   const b=[];
-  const u16=v=>{b.push(v&0xff,(v>>8)&0xff);};
   const u32=v=>{b.push(v&0xff,(v>>8)&0xff,(v>>16)&0xff,(v>>>24)&0xff);};
-  // global header
-  u32(0xa1b2c3d4); u16(2); u16(4); u32(0); u32(0); u32(65535); u32(105);
+  // Section Header Block
+  u32(0x0A0D0D0A); u32(28); u32(0x1A2B3C4D); u32(0x00000001); u32(0xFFFFFFFF); u32(0xFFFFFFFF); u32(28);
+  // Interface Description Block, linktype 127, tsresol microseconds
+  u32(0x00000001); u32(32); u32(0x0000007F); u32(0); u32(0x00010009); u32(0x00000006); u32(0x00000000); u32(32);
   const AP=[0x00,0x11,0x22,0x33,0x44,0x55], STA=[0xAA,0xBB,0xCC,0xDD,0xEE,0xFF];
-  const rec=frame=>{ u32(0); u32(0); u32(frame.length); u32(frame.length); frame.forEach(x=>b.push(x)); };
+  let ts=86400000000;
+  const radiotap=(ch,rssi)=>{
+    const f=2412+(ch-1)*5;
+    return [0,0,15,0, 0x2A,0,0,0, 0x10,0, f&0xff,(f>>8)&0xff, 0xC0,0, rssi&0xff];
+  };
+  // Enhanced Packet Block wrapping radiotap + frame (+ fake 4-byte FCS)
+  const rec=frame=>{
+    const data=[...radiotap(6,-42), ...frame, 0x12,0x34,0x56,0x78];
+    const caplen=data.length, pad=(4-(caplen&3))&3, total=32+caplen+pad;
+    ts+=100000;
+    u32(0x00000006); u32(total); u32(0); u32(Math.floor(ts/0x100000000)); u32(ts>>>0);
+    u32(caplen); u32(caplen); data.forEach(x=>b.push(x));
+    for(let i=0;i<pad;i++) b.push(0); u32(total);
+  };
   const hdr=(fc,a1,a2,a3)=>[fc&0xff,(fc>>8)&0xff, 0,0, ...a1, ...a2, ...a3, 0,0];
   // beacon (SSID "HomeNet", DS channel 6)
   const ssid=[...'HomeNet'].map(c=>c.charCodeAt(0));
