@@ -164,11 +164,21 @@ function stampSec(s){
   return (+m[1])*3600 + (+m[2])*60 + (+m[3]) + (m[4]?(+('0.'+m[4])):0);
 }
 function classify(head){
-  const h = head.join(',');
-  if(h.startsWith('time,type,channel,rssi')) return 'events';
-  if(h.startsWith('time,bssid,ssid'))        return 'networks';
-  if(h.startsWith('time,total,mgmt'))        return 'stats';
+  // Match by the columns present, so an added `session` column (or any column
+  // reordering) still recognises the file.
+  const s = new Set(head.map(h=>h.trim()));
+  if(s.has('type') && s.has('src'))   return 'events';
+  if(s.has('bssid') && s.has('ssid')) return 'networks';
+  if(s.has('total') && s.has('ch1'))  return 'stats';
   return null;
+}
+const sess = r => r.session || '1';   // backward-compatible session id
+
+// Group rows by session, preserving first-seen order.
+function bySession(rows){
+  const g = {}, order = [];
+  rows.forEach(r=>{ const k=sess(r); if(!(k in g)){ g[k]=[]; order.push(k); } g[k].push(r); });
+  return order.map(k=>({ id:k, rows:g[k] }));
 }
 
 // ── pcap parsing (client-side, no upload) ────────────────────────────────────
@@ -294,27 +304,39 @@ function render(){
   destroyCharts();
   document.getElementById('dash').style.display='block';
   const st = store.stats||[], ev = store.events||[], nets = store.networks||[];
-  const last = st.length ? st[st.length-1] : null;
 
-  // Per-channel counts: prefer cumulative stats, else count sightings.
+  // The stats counters are cumulative *within* a boot and reset to zero on the
+  // next one, so to combine appended sessions we take each session's final row
+  // and sum those — never the last row of the whole file.
+  const sessions = bySession(st);
+  const finals = sessions.map(s=>s.rows[s.rows.length-1]);
+  const sumF = key => finals.reduce((a,r)=>a+(+r[key]||0),0);
+
+  // Per-channel activity: sum per-session finals; else count sightings.
   const chVals = [];
   for(let c=1;c<=13;c++){
-    if(last && ('ch'+c) in last) chVals.push(+last['ch'+c]||0);
+    if(finals.length && ('ch'+c) in finals[0]) chVals.push(sumF('ch'+c));
     else chVals.push(ev.filter(e=>+e.channel===c).length + nets.filter(n=>+n.channel===c).length);
   }
   const chMax = Math.max(1,...chVals), busiest = chVals.indexOf(chMax)+1;
 
-  // Summary cards
-  const durSec = st.length ? stampSec(st[st.length-1].time) - stampSec(st[0].time) : 0;
+  // Duration = sum of each session's own span.
+  const durSec = sessions.reduce((a,s)=>
+    a + (stampSec(s.rows[s.rows.length-1].time) - stampSec(s.rows[0].time)), 0);
   const dur = durSec>3600 ? (durSec/3600).toFixed(1)+'h' : durSec>60 ? Math.round(durSec/60)+'m' : Math.round(durSec)+'s';
-  const total = last ? +last.total : ev.length;
-  const deauth = last ? +last.deauth : ev.length;
+  const total  = finals.length ? sumF('total')  : ev.length;
+  const deauth = finals.length ? sumF('deauth') : ev.length;
+
   const pairs = Object.values(hs.pairs);
   const complete = pairs.filter(p=>(p.m[0]||p.m[2]) && (p.m[1]||p.m[3])).length;
+  const nSessions = Math.max(sessions.length,
+    new Set(ev.map(sess)).size, new Set(nets.map(sess)).size);
+  const uniqueNets = new Set(nets.map(n=>n.bssid)).size;
   const cards = [
+    ['Sessions', nSessions||'—', 'acc'],
     ['Duration', dur, ''],
     ['Packets', num(total), 'acc'],
-    ['Networks', nets.length||'—', ''],
+    ['Networks', uniqueNets||'—', ''],
     ['Deauth', num(deauth), deauth>0?'dan':''],
     ['Busiest ch', st.length||ev.length||nets.length ? ('CH'+busiest) : '—', 'acc'],
   ];
@@ -334,9 +356,9 @@ function render(){
     options:radarOpts()
   }));
 
-  // Radar: frame mix
-  const mix = last
-    ? [+last.mgmt||0, +last.ctrl||0, +last.data||0, +last.beacon||0, +last.deauth||0]
+  // Radar: frame mix — sum the per-session finals, same reasoning as channels.
+  const mix = finals.length
+    ? [sumF('mgmt'), sumF('ctrl'), sumF('data'), sumF('beacon'), sumF('deauth')]
     : [0,0,0,0,ev.length];
   charts.push(new Chart(document.getElementById('radarFrame'),{
     type:'radar',
@@ -346,34 +368,47 @@ function render(){
     options:radarOpts()
   }));
 
-  // Line: cumulative total + per-window rate
+  // Line: packets/s and a combined cumulative deauth. Sessions are laid end to
+  // end on one elapsed axis (each boot's clock restarts at zero), and the
+  // deauth line is rebuilt as a running total so it climbs monotonically
+  // across the whole capture instead of sawtoothing at each reset.
   if(st.length){
-    const t0 = stampSec(st[0].time);
-    const labels = st.map(r=>Math.round(stampSec(r.time)-t0)+'s');
+    const labels=[], rate=[], deauthCum=[], srow=[];
+    let base=0, cum=0;
+    sessions.forEach(s=>{
+      const s0=stampSec(s.rows[0].time); let prev=0;
+      s.rows.forEach(r=>{
+        labels.push(Math.round(base + stampSec(r.time)-s0)+'s');
+        rate.push(+r.rate||0);
+        const d=+r.deauth||0; cum += Math.max(0, d-prev); prev=d;
+        deauthCum.push(cum); srow.push(s.id);
+      });
+      base += stampSec(s.rows[s.rows.length-1].time) - s0;
+    });
     charts.push(new Chart(document.getElementById('lineTraffic'),{
       type:'line',
       data:{ labels, datasets:[
-        { label:'packets/s', data:st.map(r=>+r.rate||0), yAxisID:'y', borderColor:ACCENT, backgroundColor:'rgba(0,255,189,.12)', fill:true, tension:.3, pointRadius:0, borderWidth:2 },
-        { label:'deauth (cum)', data:st.map(r=>+r.deauth||0), yAxisID:'y1', borderColor:DANGER, tension:.3, pointRadius:0, borderWidth:1.5 },
+        { label:'packets/s', data:rate, yAxisID:'y', borderColor:ACCENT, backgroundColor:'rgba(0,255,189,.12)', fill:true, tension:.3, pointRadius:0, borderWidth:2 },
+        { label:'deauth (combined)', data:deauthCum, yAxisID:'y1', borderColor:DANGER, tension:.3, pointRadius:0, borderWidth:1.5 },
       ]},
       options:{ responsive:true, interaction:{mode:'index',intersect:false},
         scales:{ x:{grid:{color:SEP}}, y:{position:'left',grid:{color:SEP},title:{display:true,text:'pkt/s'}},
                  y1:{position:'right',grid:{display:false},title:{display:true,text:'deauth'}} },
-        plugins:{legend:{labels:{boxWidth:12}}} }
+        plugins:{legend:{labels:{boxWidth:12}}, tooltip:{callbacks:{title:i=>'session '+srow[i[0].dataIndex]+' · '+i[0].label}}} }
     }));
   } else document.getElementById('lineTraffic').parentElement.style.display='none';
 
-  // Deauth events over time, coloured by RSSI, one bar per event
+  // Deauth events, one bar per event coloured by RSSI, across all sessions.
   if(ev.length){
-    const t0 = stampSec(ev[0].time);
     charts.push(new Chart(document.getElementById('deauthChart'),{
       type:'bar',
-      data:{ labels:ev.map(e=>Math.round(stampSec(e.time)-t0)+'s'),
+      data:{ labels:ev.map((e,i)=>i+1),
         datasets:[{ label:'RSSI (dBm)', data:ev.map(e=>+e.rssi||0),
           backgroundColor:ev.map(e=>(+e.rssi>=-60?ACCENT:+e.rssi>=-75?WARN:DANGER)) }]},
-      options:{ responsive:true, scales:{ x:{grid:{display:false}}, y:{grid:{color:SEP},title:{display:true,text:'dBm'}} },
-        plugins:{legend:{display:false}, tooltip:{callbacks:{afterLabel:c=>{
-          const e=ev[c.dataIndex]; return 'ch'+e.channel+'  '+e.type+'\nsrc '+e.src; }}}} }
+      options:{ responsive:true, scales:{ x:{grid:{display:false},title:{display:true,text:'event #'}}, y:{grid:{color:SEP},title:{display:true,text:'dBm'}} },
+        plugins:{legend:{display:false}, tooltip:{callbacks:{
+          title:i=>'session '+sess(ev[i[0].dataIndex])+' · '+ev[i[0].dataIndex].time,
+          afterLabel:c=>{ const e=ev[c.dataIndex]; return 'ch'+e.channel+'  '+e.type+'\nsrc '+e.src; }}}} }
     }));
   } else document.getElementById('deauthChart').parentElement.style.display='none';
 
@@ -434,18 +469,35 @@ function radarOpts(){
     plugins:{legend:{display:false}} };
 }
 
+// Collapse the same BSSID seen across several sessions into one row, keeping
+// the strongest signal and counting how many sessions it appeared in.
+function dedupeNets(nets){
+  const m = {};
+  nets.forEach(n=>{
+    const k=n.bssid, cur=m[k];
+    if(!cur){ m[k]={...n, seen:new Set([sess(n)])}; }
+    else{
+      cur.seen.add(sess(n));
+      if((+n.rssi||-127) > (+cur.rssi||-127)){ cur.rssi=n.rssi; cur.channel=n.channel; }
+      if(!cur.ssid && n.ssid) cur.ssid=n.ssid;
+    }
+  });
+  return Object.values(m).map(n=>({...n, sessions:n.seen.size}));
+}
+
 let sortKey='rssi', sortDir=-1;
-function renderNetTable(nets){
+function renderNetTable(rawNets){
+  const nets = dedupeNets(rawNets);
   const thead = document.querySelector('#netTable thead');
   const tbody = document.querySelector('#netTable tbody');
-  const cols = [['ssid','SSID'],['bssid','BSSID'],['channel','CH'],['rssi','RSSI'],['security','SEC'],['time','FIRST SEEN']];
+  const cols = [['ssid','SSID'],['bssid','BSSID'],['channel','CH'],['rssi','BEST RSSI'],['security','SEC'],['sessions','SEEN IN']];
   thead.innerHTML = '<tr>'+cols.map(c=>`<th data-k="${c[0]}">${c[1]}</th>`).join('')+'</tr>';
   thead.querySelectorAll('th').forEach(th=>th.onclick=()=>{
-    const k=th.dataset.k; sortDir = (k===sortKey)?-sortDir:-1; sortKey=k; renderNetTable(nets);
+    const k=th.dataset.k; sortDir = (k===sortKey)?-sortDir:-1; sortKey=k; renderNetTable(rawNets);
   });
-  const rows = [...nets].sort((a,b)=>{
+  const rows = nets.sort((a,b)=>{
     let x=a[sortKey], y=b[sortKey];
-    if(sortKey==='rssi'||sortKey==='channel'){ x=+x; y=+y; }
+    if(sortKey==='rssi'||sortKey==='channel'||sortKey==='sessions'){ x=+x; y=+y; }
     return (x<y?-1:x>y?1:0)*sortDir;
   });
   tbody.innerHTML = rows.map(n=>`<tr>
@@ -454,7 +506,7 @@ function renderNetTable(nets){
     <td>${n.channel}</td>
     <td style="color:${+n.rssi>=-60?ACCENT:+n.rssi>=-75?WARN:DANGER}">${n.rssi}</td>
     <td class="${n.security==='enc'?'enc':'open'}">${n.security}</td>
-    <td class="mac">${n.time}</td></tr>`).join('');
+    <td class="mac">${n.sessions}&times;</td></tr>`).join('');
 }
 function esc(s){ return (s||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
 
@@ -470,33 +522,38 @@ drop.addEventListener('drop',e=>readFiles(e.dataTransfer.files));
 // ── Demo data ──────────────────────────────────────────────────────────────
 document.getElementById('demo').onclick = e=>{
   e.stopPropagation();
-  const chans=[1,6,11], nets=[];
-  let netCsv='time,bssid,ssid,channel,rssi,security\n';
+  // Two sessions appended into the same files (as the firmware now does), so
+  // the session-aware combining is exercised. Time restarts each session and
+  // the stats counters reset to zero.
+  const hhmmss = s => String(Math.floor(s/3600)).padStart(2,'0')+':'+
+    String(Math.floor(s/60)%60).padStart(2,'0')+':'+String(s%60).padStart(2,'0')+'.000';
   const names=['HomeNet','office-5G','FreeWiFi','','NETGEAR47','Livebox-A2','coffee_guest','IoT-hub'];
-  for(let i=0;i<8;i++){
-    const ch=[1,6,11,3,6,11,1,9][i], r=-40-Math.floor(Math.random()*45);
-    netCsv+=`00:0${i}:0${i}:0${i}:0${i}:0${i},${i%4===3?'':names[i]},${ch},${r},${i%3?'enc':'open'}\n`;
-  }
-  let evCsv='time,type,channel,rssi,src,dst\n';
-  for(let i=0;i<14;i++){
-    const s=120+i*17, hh=String(Math.floor(s/3600)).padStart(2,'0'),
-      mm=String(Math.floor(s/60)%60).padStart(2,'0'), ss=String(s%60).padStart(2,'0');
-    evCsv+=`${hh}:${mm}:${ss}.000,${i%5===0?'disassoc':'deauth'},${[6,11,1,6][i%4]},${-45-Math.floor(Math.random()*40)},DE:AD:BE:EF:00:0${i%9},FF:FF:FF:FF:FF:FF\n`;
-  }
-  let stCsv='time,total,mgmt,ctrl,data,beacon,deauth,rate';
+
+  let netCsv='session,time,bssid,ssid,channel,rssi,security\n';
+  let evCsv='session,time,type,channel,rssi,src,dst\n';
+  let stCsv='session,time,total,mgmt,ctrl,data,beacon,deauth,rate';
   for(let c=1;c<=13;c++) stCsv+=',ch'+c; stCsv+='\n';
-  let tot=0,mg=0,ct=0,da=0,be=0,de=0; const ch=[0,0,0,0,0,0,0,0,0,0,0,0,0,0];
-  for(let k=0;k<40;k++){
-    const rate=200+Math.round(120*Math.sin(k/4)+Math.random()*80);
-    tot+=rate; mg+=Math.round(rate*.35); ct+=Math.round(rate*.15); da+=Math.round(rate*.5);
-    be+=Math.round(rate*.2); if(k%9===3) de+=2;
-    [1,6,11].forEach(c=>ch[c]+=Math.round(rate*(c===6?.5:c===1?.3:.2)));
-    const s=100+k*5, hh=String(Math.floor(s/3600)).padStart(2,'0'),
-      mm=String(Math.floor(s/60)%60).padStart(2,'0'), ss=String(s%60).padStart(2,'0');
-    stCsv+=`${hh}:${mm}:${ss}.000,${tot},${mg},${ct},${da},${be},${de},${rate}`;
-    for(let c=1;c<=13;c++) stCsv+=','+ch[c];
-    stCsv+='\n';
+
+  for(let sn=1; sn<=2; sn++){
+    for(let i=0;i<8;i++){
+      const ch=[1,6,11,3,6,11,1,9][i], r=-40-Math.floor(Math.random()*45);
+      netCsv+=`${sn},${hhmmss(30+i*4)},00:0${i}:0${i}:0${i}:0${i}:0${i},${i%4===3?'':names[i]},${ch},${r},${i%3?'enc':'open'}\n`;
+    }
+    for(let i=0;i<12;i++){
+      evCsv+=`${sn},${hhmmss(120+i*17)},${i%5===0?'disassoc':'deauth'},${[6,11,1,6][i%4]},${-45-Math.floor(Math.random()*40)},DE:AD:BE:EF:00:0${i%9},FF:FF:FF:FF:FF:FF\n`;
+    }
+    let tot=0,mg=0,ct=0,da=0,be=0,de=0; const ch=Array(14).fill(0);
+    for(let k=0;k<30;k++){
+      const rate=200+Math.round(120*Math.sin(k/4)+Math.random()*80);
+      tot+=rate; mg+=Math.round(rate*.35); ct+=Math.round(rate*.15); da+=Math.round(rate*.5);
+      be+=Math.round(rate*.2); if(k%9===3) de+=2;
+      [1,6,11].forEach(c=>ch[c]+=Math.round(rate*(c===6?.5:c===1?.3:.2)));
+      stCsv+=`${sn},${hhmmss(100+k*5)},${tot},${mg},${ct},${da},${be},${de},${rate}`;
+      for(let c=1;c<=13;c++) stCsv+=','+ch[c];
+      stCsv+='\n';
+    }
   }
+  store.events=store.networks=store.stats=null;
   ingest('demo-networks.csv',netCsv);
   ingest('demo-events.csv',evCsv);
   ingest('demo-stats.csv',stCsv);

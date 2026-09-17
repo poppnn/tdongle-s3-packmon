@@ -126,33 +126,35 @@ Logging is **opt-in by hardware**: on boot, during the splash, packmon probes fo
 runs exactly as before and never touches the card again. The splash shows `SD OK  logging sNNNN`
 or `no SD  logging off`, and the SYSTEM page shows the state live.
 
-When a card is found, a single `packmon-logs/` folder is created at the card root, holding everything
-for every session — the CSV logs and the handshake `.pcap`, all sharing the `sNNNN` prefix.
+When a card is found, a single `packmon-logs/` folder is created at the card root. The files have
+**fixed names and are appended to on every boot**, so you build one combined dataset over time
+instead of a new file each session. Each row carries a `session` number (an incrementing counter
+kept in `session.txt`), and the pcap simply gets more packets after its one-time global header — so
+the runs stay separable even though timestamps (`HH:MM:SS.mmm`) restart at zero each boot (no RTC).
 
-### `packmon-logs/` — one folder, everything in it
-
-One set of files per session (`sNNNN`, an incrementing counter kept in `session.txt`). Timestamps
-are `HH:MM:SS.mmm` from power-on — there is no RTC.
+### `packmon-logs/` — one folder, appended across boots
 
 | File | One row per | Columns |
 |---|---|---|
-| `sNNNN-events.csv` | deauth / disassoc frame | `time, type, channel, rssi, src, dst` |
-| `sNNNN-networks.csv` | network first seen | `time, bssid, ssid, channel, rssi, security` |
-| `sNNNN-stats.csv` | 5-second snapshot | `time, total, mgmt, ctrl, data, beacon, deauth, rate, ch1..ch13` |
-| `sNNNN.pcap` | captured 802.11 frame | libpcap (link type 105), handshakes + a beacon per network |
+| `events.csv` | deauth / disassoc frame | `session, time, type, channel, rssi, src, dst` |
+| `networks.csv` | network first seen | `session, time, bssid, ssid, channel, rssi, security` |
+| `stats.csv` | 5-second snapshot | `session, time, total, mgmt, ctrl, data, beacon, deauth, rate, ch1..ch13` |
+| `capture.pcap` | captured 802.11 frame | libpcap (link type 105), handshakes + a beacon per network |
 
 The CSVs are kept open for the session and flushed every 3 s, so a yanked card loses at most the last
 few seconds. SSIDs are sanitised (commas, quotes and control bytes stripped) so the CSV never breaks.
+Because the stats counters are cumulative *within* a boot and reset on the next, the viewer sums each
+session's final row rather than reading the last line of the file.
 
-### `sNNNN.pcap` — handshake captures
+### `capture.pcap` — handshake captures
 
 EAPOL frames from WPA/WPA2 four-way handshakes travel in the clear as data frames, so they are
-visible in monitor mode. Each one is written to the session `.pcap` (libpcap, link type 105 = IEEE
+visible in monitor mode. Each one is appended to `capture.pcap` (libpcap, link type 105 = IEEE
 802.11), along with one beacon per network so the capture carries the SSID. Open it in Wireshark, or
 convert it for cracking:
 
 ```bash
-hcxpcapngtool -o handshake.22000 sNNNN.pcap
+hcxpcapngtool -o handshake.22000 capture.pcap
 hashcat -m 22000 handshake.22000 wordlist.txt
 ```
 

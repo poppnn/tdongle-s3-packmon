@@ -269,9 +269,10 @@ static uint16_t rssi_color(int8_t r) {
 }
 
 // ─── SD logging ────────────────────────────────────────────────────────────
-// Per session, all under /packmon-logs: three plain CSV files plus one .pcap
-// of captured handshakes, sharing the sNNNN prefix. CSV is chosen so the raw
-// files are readable in any text editor or spreadsheet; the bundled viewer
+// All under /packmon-logs, with fixed names appended to across boots:
+// events.csv, networks.csv, stats.csv and capture.pcap. Each row carries a
+// `session` number so the combined data stays separable. CSV is chosen so the
+// raw files are readable in any text editor or spreadsheet; the bundled viewer
 // turns them into charts. Files are kept open for the whole session and
 // flushed on a timer, so no line is lost to a yank but the card is not
 // hammered per write.
@@ -300,9 +301,9 @@ static void log_event(const uint8_t *src, const uint8_t *dst, uint8_t sub,
                       uint8_t ch, int8_t rssi) {
     if (!sd_ok || !f_events) return;
     char ts[16]; log_stamp(ts, sizeof(ts), millis());
-    f_events.printf("%s,%s,%u,%d,%02X:%02X:%02X:%02X:%02X:%02X,"
+    f_events.printf("%d,%s,%s,%u,%d,%02X:%02X:%02X:%02X:%02X:%02X,"
                     "%02X:%02X:%02X:%02X:%02X:%02X\n",
-                    ts, sub == SUB_DEAUTH ? "deauth" : "disassoc", ch, rssi,
+                    log_session, ts, sub == SUB_DEAUTH ? "deauth" : "disassoc", ch, rssi,
                     src[0], src[1], src[2], src[3], src[4], src[5],
                     dst[0], dst[1], dst[2], dst[3], dst[4], dst[5]);
     log_dirty = true;
@@ -311,8 +312,8 @@ static void log_event(const uint8_t *src, const uint8_t *dst, uint8_t sub,
 static void log_network(const ap_t *a) {
     if (!sd_ok || !f_nets) return;
     char ts[16]; log_stamp(ts, sizeof(ts), millis());
-    f_nets.printf("%s,%02X:%02X:%02X:%02X:%02X:%02X,",
-                  ts, a->bssid[0], a->bssid[1], a->bssid[2],
+    f_nets.printf("%d,%s,%02X:%02X:%02X:%02X:%02X:%02X,",
+                  log_session, ts, a->bssid[0], a->bssid[1], a->bssid[2],
                   a->bssid[3], a->bssid[4], a->bssid[5]);
     log_csv_ssid(f_nets, a->ssid);
     f_nets.printf(",%u,%d,%s\n", a->channel, a->rssi, a->enc ? "enc" : "open");
@@ -322,8 +323,8 @@ static void log_network(const ap_t *a) {
 static void log_stats(uint32_t rate) {
     if (!sd_ok || !f_stats) return;
     char ts[16]; log_stamp(ts, sizeof(ts), millis());
-    f_stats.printf("%s,%u,%u,%u,%u,%u,%u,%u",
-                   ts, s_total, s_mgmt, s_ctrl, s_data, s_beacon, s_deauth, rate);
+    f_stats.printf("%d,%s,%u,%u,%u,%u,%u,%u,%u",
+                   log_session, ts, s_total, s_mgmt, s_ctrl, s_data, s_beacon, s_deauth, rate);
     for (int c = 1; c <= MAX_CHANNELS; c++) f_stats.printf(",%u", s_ch[c]);
     f_stats.print("\n");
     log_dirty = true;
@@ -383,8 +384,14 @@ static int sd_next_session() {
     return n;
 }
 
-// Mount the card and open this session's files. Called once from the splash;
-// everything logging-related keys off the sd_ok it returns.
+// Mount the card and open the session-shared log files. Called once from the
+// splash; everything logging-related keys off the sd_ok it returns.
+//
+// Files have fixed names and are opened for APPEND, so every boot adds to the
+// same growing dataset instead of leaving a trail of per-session files. A
+// `session` column (and, for the pcap, simply more packets after the single
+// global header) keeps the runs separable — the timestamps restart at zero
+// each boot because there is no RTC.
 static bool sd_init() {
     SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0);
     if (!SD_MMC.begin("/sdcard", true, false, 20000)) return false;   // 1-bit
@@ -393,26 +400,25 @@ static bool sd_init() {
     SD_MMC.mkdir("/packmon-logs");
     log_session = sd_next_session();
 
-    char path[40];
-    snprintf(path, sizeof(path), "/packmon-logs/s%04d-events.csv", log_session);
-    f_events = SD_MMC.open(path, FILE_WRITE);
-    if (f_events) f_events.print("time,type,channel,rssi,src,dst\n");
+    f_events = SD_MMC.open("/packmon-logs/events.csv", FILE_APPEND);
+    if (f_events && f_events.size() == 0)
+        f_events.print("session,time,type,channel,rssi,src,dst\n");
 
-    snprintf(path, sizeof(path), "/packmon-logs/s%04d-networks.csv", log_session);
-    f_nets = SD_MMC.open(path, FILE_WRITE);
-    if (f_nets) f_nets.print("time,bssid,ssid,channel,rssi,security\n");
+    f_nets = SD_MMC.open("/packmon-logs/networks.csv", FILE_APPEND);
+    if (f_nets && f_nets.size() == 0)
+        f_nets.print("session,time,bssid,ssid,channel,rssi,security\n");
 
-    snprintf(path, sizeof(path), "/packmon-logs/s%04d-stats.csv", log_session);
-    f_stats = SD_MMC.open(path, FILE_WRITE);
-    if (f_stats) {
-        f_stats.print("time,total,mgmt,ctrl,data,beacon,deauth,rate");
+    f_stats = SD_MMC.open("/packmon-logs/stats.csv", FILE_APPEND);
+    if (f_stats && f_stats.size() == 0) {
+        f_stats.print("session,time,total,mgmt,ctrl,data,beacon,deauth,rate");
         for (int c = 1; c <= MAX_CHANNELS; c++) f_stats.printf(",ch%d", c);
         f_stats.print("\n");
     }
 
-    snprintf(path, sizeof(path), "/packmon-logs/s%04d.pcap", log_session);
-    f_hs = SD_MMC.open(path, FILE_WRITE);
-    if (f_hs) pcap_write_header(f_hs);
+    // The pcap global header is written once, when the file is first created;
+    // later boots append their packet records after it.
+    f_hs = SD_MMC.open("/packmon-logs/capture.pcap", FILE_APPEND);
+    if (f_hs && f_hs.size() == 0) pcap_write_header(f_hs);
 
     log_dirty = true;
     return f_events && f_stats;
