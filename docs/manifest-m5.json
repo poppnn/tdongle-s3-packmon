@@ -1,0 +1,13 @@
+{
+  "name": "poppn packmon (M5StickC Plus2)",
+  "version": "1.0.0",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "firmware/poppn-packmon-m5.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

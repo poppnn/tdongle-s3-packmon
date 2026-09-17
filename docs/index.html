@@ -70,6 +70,18 @@
 
   .flash { text-align: center; }
   .flash p.hint { color: var(--label); font-size: 13px; margin: 14px 0 0; }
+  .devsel { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-bottom: 18px; }
+  .dev {
+    flex: 1; min-width: 160px; max-width: 260px;
+    background: var(--panel-2); border: 1px solid var(--sep); border-radius: 10px;
+    padding: 12px 14px; cursor: pointer; text-align: left; font-family: var(--mono);
+    color: var(--label); transition: border-color .12s, background .12s;
+  }
+  .dev:hover { border-color: var(--accent-d, #006e54); }
+  .dev.on { border-color: var(--accent); background: rgba(0,255,189,.07); }
+  .dev b { display: block; color: var(--text); font-size: 14px; margin-bottom: 3px; }
+  .dev.on b { color: var(--accent); }
+  .dev span { font-size: 11px; color: var(--label); }
   esp-web-install-button { --esp-tools-button-color: #080808; }
   esp-web-install-button[install-unsupported] { display: block; }
   .btn {
@@ -154,8 +166,17 @@
 
   <section class="panel flash">
     <h2>Flash from your browser</h2>
-    <esp-web-install-button manifest="manifest.json">
-      <button class="btn" slot="activate">⚡ Install poppn packmon</button>
+    <p class="hint" style="margin:0 0 14px;">Choose your board:</p>
+    <div class="devsel">
+      <button class="dev on" id="dev-tdongle" onclick="pickDevice('tdongle')">
+        <b>T-Dongle S3</b><span>ESP32-S3 · SD card · USB drive</span>
+      </button>
+      <button class="dev" id="dev-m5" onclick="pickDevice('m5')">
+        <b>M5StickC Plus2</b><span>ESP32 · flash storage · Web UI</span>
+      </button>
+    </div>
+    <esp-web-install-button id="installer" manifest="manifest.json">
+      <button class="btn" slot="activate">⚡ Install on <span id="dev-name">T-Dongle S3</span></button>
       <div slot="unsupported" class="unsupported">
         <b>Browser not supported.</b> Web Serial is required — use desktop Chrome, Edge or Opera.
         Firefox and Safari cannot flash devices.
@@ -164,18 +185,42 @@
         <b>HTTPS required.</b> Open this page over https:// to flash.
       </div>
     </esp-web-install-button>
-    <p class="hint">No install, no toolchain — plug the dongle in and click.</p>
+    <p class="hint">No install, no toolchain — plug the device in and click.</p>
   </section>
+
+  <script>
+    function pickDevice(d){
+      var t = d === 'm5';
+      document.getElementById('installer').setAttribute('manifest', t ? 'manifest-m5.json' : 'manifest.json');
+      document.getElementById('dev-name').textContent = t ? 'M5StickC Plus2' : 'T-Dongle S3';
+      document.getElementById('dev-tdongle').classList.toggle('on', !t);
+      document.getElementById('dev-m5').classList.toggle('on', t);
+    }
+  </script>
 
   <section class="panel">
     <h2>How to flash</h2>
     <ol class="steps">
-      <li>Hold the <b>BOOT</b> button on the dongle, plug it into a USB port, then release.</li>
-      <li>Click <b>Install poppn packmon</b> above.</li>
-      <li>Pick the serial port in the browser dialog (<code>USB JTAG/serial debug unit</code> or a COM/ttyACM port).</li>
+      <li>Pick your board above.</li>
+      <li><b>T-Dongle S3:</b> hold <b>BOOT</b> while plugging it in, then release. <b>M5StickC Plus2:</b> just plug it in (it enters download mode on its own).</li>
+      <li>Click <b>Install</b>, pick the serial port in the browser dialog.</li>
       <li>Choose <b>Install</b>, confirm the erase, and wait ~30&nbsp;s.</li>
-      <li>Unplug and replug. The splash animation means you're done.</li>
+      <li>Unplug and replug. The splash means you're done.</li>
     </ol>
+  </section>
+
+  <section class="panel">
+    <h2>Two boards, one firmware family</h2>
+    <table>
+      <tr><td class="k"><b>T-Dongle S3</b></td><td class="v">ESP32-S3 · logs to a microSD card · read the card as a USB drive · full serial console</td></tr>
+      <tr><td class="k"><b>M5StickC Plus2</b></td><td class="v">ESP32 · logs to internal flash (LittleFS) · read them over a built-in <b>Web UI</b> (the device hosts its own WiFi hotspot) · same capture formats</td></tr>
+    </table>
+    <p style="color:var(--label);font-size:13px;margin:12px 0 0;">
+      The M5 has no SD slot and no USB Mass Storage, so on it you press <b>Btn B</b> to start a hotspot
+      (<code>packmon-XXXX</code>, password <code>packmon123</code>), join it, and open
+      <code>192.168.4.1</code> to see live stats and download the CSVs and <code>capture.pcapng</code>.
+      Sniffing pauses while the Web UI is on.
+    </p>
   </section>
 
   <section class="panel">

@@ -1,12 +1,40 @@
 # poppn packmon
 
-WiFi packet monitor and deauthentication-attack detector for the **LilyGO T-Dongle S3**.
+WiFi packet monitor and deauthentication-attack detector, for two boards:
 
-Plug it into any USB port and it becomes a standalone 802.11 monitor: it hops channels 1–13,
-graphs live packet rate on the built-in 160×80 display, and raises a full-screen alert with the
-attacker's MAC, channel and RSSI the moment it sees a deauth or disassoc frame.
+- **LilyGO T-Dongle S3** (ESP32-S3) — logs to a microSD card, readable as a USB drive.
+- **M5StickC Plus2** (ESP32) — logs to internal flash, readable over a built-in Web UI.
 
-**[→ Flash it from your browser](https://poppnn.github.io/tdongle-s3-packmon/)** — no toolchain needed.
+Plug it in and it becomes a standalone 802.11 monitor: it hops channels 1–13, graphs live packet
+rate on the built-in display, and raises a full-screen alert with the attacker's MAC, channel and
+RSSI the moment it sees a deauth or disassoc frame — and captures handshakes to a `.pcapng`.
+
+**[→ Flash it from your browser](https://poppnn.github.io/tdongle-s3-packmon/)** — pick your board,
+no toolchain needed.
+
+## Boards
+
+Both targets share the same sniffer, capture formats (CSV + pcapng) and on-screen pages; they differ
+only in how you get the data off:
+
+| | T-Dongle S3 | M5StickC Plus2 |
+|---|---|---|
+| Chip | ESP32-S3 | ESP32-PICO-V3-02 |
+| Display | ST7735 160×80 | ST7789 240×135 |
+| Storage | microSD (`packmon-logs/`) | internal flash (LittleFS) |
+| Get data off | USB Mass Storage or SD reader | **Web UI** over its own hotspot |
+| Serial console | yes (USB CDC) | — |
+| Build env | `lilygo-t-dongle-s3` → `src/main.cpp` | `m5stick-c-plus2` → `src/m5/main.cpp` |
+
+On the **M5StickC Plus2**: Btn A cycles pages (hold = channel lock), **Btn B toggles the Web UI**.
+When the Web UI is on, the device starts a WiFi hotspot `packmon-XXXX` (password `packmon123`);
+join it and open `http://192.168.4.1` for live stats and to download the CSVs and `capture.pcapng`.
+Sniffing pauses while the Web UI is on (the radio can't monitor and host an AP at once).
+
+```bash
+pio run -e lilygo-t-dongle-s3     # T-Dongle S3
+pio run -e m5stick-c-plus2        # M5StickC Plus2
+```
 
 ---
 
