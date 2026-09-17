@@ -135,6 +135,26 @@ static uint8_t cap_bssid[CAP_BSSIDS][6];
 static int     cap_bssid_n = 0;
 static uint64_t ts_base = 0;         // per-session offset for monotonic ts
 
+// EAPOL handshake completeness per AP+client, so the LIVE page can say whether
+// what we caught is actually usable. msgs is a bitmask: bit0..3 = M1..M4. A
+// pair is usable when it has an ANonce (M1 or M3) and a MIC (M2 or M4).
+#define HSST_MAX 12
+typedef struct { uint8_t ap[6], sta[6]; uint8_t msgs; } hsst_t;
+static hsst_t hsst[HSST_MAX];
+static int hsst_n = 0;
+volatile uint8_t hs_pairs = 0;       // distinct AP+client pairs with any EAPOL
+volatile uint8_t hs_ok    = 0;       // pairs that are usable/crackable
+
+// Which of the four handshake messages a Key Information field describes.
+static inline uint8_t eapol_msg(uint16_t ki) {
+    bool mic = ki & 0x0100, ack = ki & 0x0080, inst = ki & 0x0040, sec = ki & 0x0200;
+    if (ack && !mic)          return 1;
+    if (!ack && mic && !sec)  return 2;
+    if (ack && mic && inst)   return 3;
+    if (!ack && mic && sec)   return 4;
+    return 0;
+}
+
 static bool sd_ok = false;   // decided once, during the boot splash
 
 // ─── USB Mass Storage ──────────────────────────────────────────────────────
@@ -685,6 +705,35 @@ void IRAM_ATTR pkt_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
                     l[6] == 0x88 && l[7] == 0x8E) {
                     s_eapol++;
                     cap_push(pkt->payload, len, rx->rssi, current_channel);
+                    // Classify the message and track handshake completeness.
+                    if (len >= hdr + 15) {
+                        uint8_t m = eapol_msg((uint16_t)((l[13] << 8) | l[14]));
+                        if (m) {
+                            bool fromds = (fc >> 9) & 1;
+                            const uint8_t *ap  = fromds ? h->addr2 : h->addr1;
+                            const uint8_t *sta = fromds ? h->addr1 : h->addr2;
+                            int s = -1;
+                            for (int i = 0; i < hsst_n; i++)
+                                if (!memcmp(hsst[i].ap, ap, 6) && !memcmp(hsst[i].sta, sta, 6)) { s = i; break; }
+                            if (s < 0 && hsst_n < HSST_MAX) {
+                                s = hsst_n++;
+                                memcpy(hsst[s].ap, ap, 6);
+                                memcpy(hsst[s].sta, sta, 6);
+                                hsst[s].msgs = 0;
+                            }
+                            if (s >= 0) {
+                                hsst[s].msgs |= (uint8_t)(1 << (m - 1));
+                                uint8_t pairs = 0, ok = 0;
+                                for (int i = 0; i < hsst_n; i++) {
+                                    pairs++;
+                                    uint8_t g = hsst[i].msgs;
+                                    if ((g & 0x5) && (g & 0xA)) ok++;   // (M1|M3) & (M2|M4)
+                                }
+                                hs_pairs = pairs;
+                                hs_ok = ok;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -926,9 +975,23 @@ static void page_live(int ox) {
     uint32_t d = s_deauth;
     txt_r(ox + SCR_W - 4, 43, d ? C_DANGER : C_LABEL, 1, "DEAUTH %u", d);
 
+    // Handshake status: how many EAPOL frames, and whether any captured
+    // handshake is actually usable (has an ANonce + a MIC).
+    int hy = 50;
+    if (s_eapol == 0) {
+        txt(ox + 4, hy, C_SEP, 1, "HS  no EAPOL yet");
+    } else {
+        txt(ox + 4, hy, C_LABEL, 1, "EAPOL");
+        txt(ox + 42, hy, C_TEXT, 1, "%u", s_eapol);
+        if (hs_ok > 0)
+            txt(ox + 74, hy, C_OK,   1, "USABLE %u/%u", hs_ok, hs_pairs);
+        else
+            txt(ox + 74, hy, C_WARN, 1, "PARTIAL %u", hs_pairs);
+    }
+
     // Area chart: gradient body with a bright tip, scaled on an eased max so
     // the whole plot does not jump when a new peak arrives.
-    const int gx = ox + 4, gy = 52, gh = 20;
+    const int gx = ox + 4, gy = 59, gh = 14;
     gfx->fillRect(gx, gy, GRAPH_W, gh, C_ROW);
 
     uint16_t peak = 1;
@@ -1322,6 +1385,7 @@ static void reset_stats() {
     memset(graph, 0, sizeof(graph));
     memset(aps, 0, sizeof(aps));
     ap_count = threat_count = threat_next = 0;
+    hsst_n = 0; hs_pairs = hs_ok = 0; cap_bssid_n = 0;
     alert_on = alert_jump = false;
     last_snapshot = 0;
     rate_window_base = 0;
@@ -1375,10 +1439,10 @@ static void serial_list_threats() {
 
 static void serial_status() {
     Serial.printf("status: up=%us ch=%d%s pkts=%u (mgmt=%u ctrl=%u data=%u beacon=%u) "
-                  "deauth=%u eapol=%u aps=%u rate=%u/s page=%s sd=%s usb=%s heap=%u\n",
+                  "deauth=%u eapol=%u hs=%u/%u aps=%u rate=%u/s page=%s sd=%s usb=%s heap=%u\n",
                   (millis() - boot_ms) / 1000, current_channel, ch_lock ? "(lock)" : "",
                   s_total, s_mgmt, s_ctrl, s_data, s_beacon, s_deauth, s_eapol,
-                  ap_active(), last_rate, PAGE_NAME[page],
+                  hs_ok, hs_pairs, ap_active(), last_rate, PAGE_NAME[page],
                   sd_ok ? "on" : "off", msc_mode ? "mounted" : "idle",
                   ESP.getFreeHeap());
 }

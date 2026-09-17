@@ -29,7 +29,7 @@ attacker's MAC, channel and RSSI the moment it sees a deauth or disassoc frame.
 
 | Page | Shows |
 |---|---|
-| **LIVE** | packets/sec, total packets, deauth count, 30 s rate graph |
+| **LIVE** | packets/sec, total packets, deauth count, EAPOL / handshake-usable status, 30 s rate graph |
 | **CHANNELS** | activity bar per channel 1–13, busiest channel and its share |
 | **NETWORKS** | nearby APs sorted by signal — SSID, lock, channel, RSSI bars |
 | **THREATS** | deauth total and the last three events with MAC, channel, RSSI, age |
@@ -177,7 +177,14 @@ Frames are written as **pcapng** with a **radiotap** header (channel + signal pe
 - **one beacon per network** to name the ESSID
 
 ESP32 monitor frames include the 4-byte FCS, so the radiotap header flags it (`FCS at end`) to avoid
-"malformed packet" noise. Convert and crack:
+"malformed packet" noise.
+
+The **LIVE** page tells you at a glance whether you have anything worth exporting: it shows the EAPOL
+frame count and, per AP+client pair, whether the handshake is **USABLE** (green — it has an ANonce from
+M1/M3 *and* a MIC from M2/M4, so it can be cracked) or only **PARTIAL** (amber — some EAPOL seen but
+not a crackable set yet). The same check appears in the serial `status` line as `hs=<usable>/<pairs>`.
+
+Convert and crack:
 
 ```bash
 hcxpcapngtool -o handshake.22000 capture.pcapng
